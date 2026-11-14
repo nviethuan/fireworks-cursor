@@ -127,6 +127,7 @@ static EFFECT: AtomicU8 = AtomicU8::new(EFFECT_FIREWORKS);
 const SKIN_CLASSIC: u8 = 0;
 const SKIN_PIXEL_LOVE: u8 = 1;
 const SKIN_CALLIGRAPHY: u8 = 2;
+const SKIN_BAT: u8 = 3;
 
 static SKIN: AtomicU8 = AtomicU8::new(SKIN_CLASSIC);
 /// Con trỏ có đang được hiển thị không (video fullscreen sẽ ẩn con trỏ)
@@ -189,6 +190,7 @@ fn load_skin_preference() {
             let skin = match value {
                 1 => SKIN_PIXEL_LOVE,
                 2 => SKIN_CALLIGRAPHY,
+                3 => SKIN_BAT,
                 _ => SKIN_CLASSIC,
             };
             SKIN.store(skin, Ordering::Relaxed);
@@ -200,6 +202,7 @@ fn skin_index() -> i64 {
     match SKIN.load(Ordering::Relaxed) {
         SKIN_PIXEL_LOVE => 1,
         SKIN_CALLIGRAPHY => 2,
+        SKIN_BAT => 3,
         _ => 0,
     }
 }
@@ -538,6 +541,7 @@ extern "C" fn change_skin(_this: &Object, _sel: Sel, sender: id) {
         let skin = match index {
             1 => SKIN_PIXEL_LOVE,
             2 => SKIN_CALLIGRAPHY,
+            3 => SKIN_BAT,
             _ => SKIN_CLASSIC,
         };
         SKIN.store(skin, Ordering::Relaxed);
@@ -643,6 +647,7 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Classic")];
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Pixel love")];
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Calligraphy brush")];
+    let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Bat blade")];
     let _: () = msg_send![skin_popup, selectItemAtIndex: skin_index()];
     let _: () = msg_send![skin_popup, setTarget: controller];
     let _: () = msg_send![skin_popup, setAction: sel!(changeSkin:)];
@@ -1318,6 +1323,113 @@ unsafe fn draw_brush_trail(points: &[(f64, f64)]) {
     }
 }
 
+/// Thêm silhouette một con dơi vào path hiện tại (toạ độ cục bộ, xoay theo hướng bay).
+fn add_bat_path(context: &CGContext, cx: f64, cy: f64, angle: f64, size: f64, flap: f64) {
+    let (sin_a, cos_a) = angle.sin_cos();
+    let wing_top = 2.2 - 1.9 * flap;
+    let wing_tip = 1.4 - 2.4 * flap;
+    // Cánh có ba mũi nhọn (mép sau răng cưa) đúng dáng dơi
+    let shape: [(f64, f64); 16] = [
+        (0.0, 2.6),
+        (0.8, 1.6),
+        (2.1, wing_top),
+        (3.6, wing_tip),
+        (2.7, 0.4),
+        (3.1, -0.8),
+        (1.7, -0.3),
+        (1.1, -1.2),
+        (0.5, -1.9),
+        (-0.5, -1.9),
+        (-1.1, -1.2),
+        (-1.7, -0.3),
+        (-3.1, -0.8),
+        (-2.7, 0.4),
+        (-3.6, wing_tip),
+        (-2.1, wing_top),
+    ];
+
+    for (i, (x, y)) in shape.iter().enumerate() {
+        let px = cx + (x * cos_a - y * sin_a) * size;
+        let py = cy + (x * sin_a + y * cos_a) * size;
+        if i == 0 {
+            context.move_to_point(px, py);
+        } else {
+            context.add_line_to_point(px, py);
+        }
+    }
+    context.close_path();
+}
+
+fn build_bat_paths(
+    context: &CGContext,
+    points: &[(f64, f64)],
+    count: usize,
+    indexes: &[usize],
+    phase: f64,
+) {
+    context.begin_path();
+    for &index in indexes {
+        let t = index as f64 / (count - 1) as f64;
+        let (nx, ny) = ribbon_normal(points, index);
+        let angle = ny.atan2(nx) + TAU / 4.0;
+        let flap = (phase + index as f64 * 0.5).sin();
+        // lệch nhẹ hai bên để bầy dơi không xếp thành một hàng cứng
+        let (nx, ny) = ribbon_normal(points, index);
+        let sway = ((index as f64 * 1.7).sin()) * 3.5;
+        add_bat_path(
+            context,
+            points[index].0 + nx * sway,
+            points[index].1 + ny * sway,
+            angle,
+            2.0 + 1.6 * t,
+            flap,
+        );
+    }
+}
+
+/// Skin "Bat blade": bầy dơi tím bay theo con trỏ, cánh đập theo nhịp.
+unsafe fn draw_bat_trail(points: &[(f64, f64)], phase: f64) {
+    let count = points.len();
+    if count < 2 {
+        return;
+    }
+    let Some(context) = current_cg_context() else {
+        return;
+    };
+
+    const STRIDE: usize = 9;
+    let mut buckets: [Vec<usize>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut index = STRIDE;
+    while index < count {
+        let t = index as f64 / (count - 1) as f64;
+        let level = ((t * 2.99) as usize).min(2);
+        buckets[level].push(index);
+        index += STRIDE;
+    }
+
+    for (level, indexes) in buckets.iter().enumerate() {
+        if indexes.is_empty() {
+            continue;
+        }
+        let fill_alpha = 0.45 + 0.25 * level as f64;
+
+        // Quầng tím -> viền tím -> thân dơi đen tím
+        build_bat_paths(&context, points, count, indexes, phase);
+        context.set_rgb_stroke_color(0.62, 0.35, 0.95, 0.12);
+        context.set_line_width(7.0);
+        context.stroke_path();
+
+        build_bat_paths(&context, points, count, indexes, phase);
+        context.set_rgb_stroke_color(0.78, 0.5, 1.0, 0.30);
+        context.set_line_width(2.0);
+        context.stroke_path();
+
+        build_bat_paths(&context, points, count, indexes, phase);
+        context.set_rgb_fill_color(0.13, 0.08, 0.2, fill_alpha);
+        context.fill_path();
+    }
+}
+
 /// Mô phỏng một frame (gọi từ timer trên main thread, mỗi frame đúng một lần).
 fn tick() {
     let now = Instant::now();
@@ -1594,6 +1706,8 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
                 draw_pixel_trail(&smooth);
             } else if skin == SKIN_CALLIGRAPHY {
                 draw_brush_trail(&smooth);
+            } else if skin == SKIN_BAT {
+                draw_bat_trail(&smooth, scene.hue_phase * TAU * 3.0);
             } else {
                 let (r, g, b) = neon_color(scene.hue_phase);
                 // Nhiều lớp, mỗi lớp là MỘT path kín: quầng -> thân -> ruột trắng
