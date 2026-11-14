@@ -702,6 +702,17 @@ struct Scene {
     idle_secs: f64,
     hue_phase: f64,
     last_frame: Option<Instant>,
+    /// Các vùng đã vẽ trong ~0.75 giây gần đây (toạ độ Cocoa toàn cục).
+    /// Phải giữ nhiều frame vì khi rê chuột rất nhanh, trail bị giới hạn 320 điểm
+    /// nên điểm cũ bị đẩy ra chỉ sau vài frame -> vùng "frame trước" không còn
+    /// chứa pixel đã vẽ trước đó, và chúng sẽ nằm lại thành "vệt dính".
+    paint_history: Vec<(f64, f64, f64, f64)>,
+    /// Vùng cần vẽ lại frame này = hợp các vùng trong `paint_history`
+    dirty_bounds: Option<(f64, f64, f64, f64)>,
+    /// Frame trước chuột có đang di chuyển không (để biết lúc vừa dừng)
+    was_moving: bool,
+    /// Yêu cầu vẽ lại toàn bộ overlay một lần (dọn sạch mọi pixel sót lại)
+    full_refresh: bool,
 }
 
 static SCENE: OnceLock<Mutex<Scene>> = OnceLock::new();
@@ -716,6 +727,10 @@ fn get_scene() -> &'static Mutex<Scene> {
             idle_secs: 0.0,
             hue_phase: 0.0,
             last_frame: None,
+            paint_history: Vec::new(),
+            dirty_bounds: None,
+            was_moving: false,
+            full_refresh: false,
         })
     })
 }
@@ -883,6 +898,66 @@ fn push_trail_segment(trail: &mut Vec<TrailPoint>, from: (f64, f64), to: (f64, f
     }
 }
 
+fn union_bounds(
+    a: Option<(f64, f64, f64, f64)>,
+    b: Option<(f64, f64, f64, f64)>,
+) -> Option<(f64, f64, f64, f64)> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some((
+            a.0.min(b.0),
+            a.1.min(b.1),
+            a.2.max(b.2),
+            a.3.max(b.3),
+        )),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// Số frame gần nhất được giữ lại để tính vùng vẽ lại (45 frame ≈ 0,75 s, dài
+/// hơn tuổi thọ một điểm trail là 0,625 s).
+const PAINT_HISTORY_FRAMES: usize = 45;
+
+/// Vùng cần vẽ lại của frame này = hợp nội dung của các frame trong
+/// `PAINT_HISTORY_FRAMES` vừa qua. Nhờ vậy mọi pixel đã vẽ còn nhìn thấy được
+/// đều nằm trong vùng được xoá, kể cả khi trail đã bị cắt bớt điểm.
+fn update_dirty_bounds(scene: &mut Scene) {
+    let mut bounds: Option<(f64, f64, f64, f64)> = None;
+    let mut include = |x: f64, y: f64, radius: f64| {
+        let (x0, y0) = (x - radius, y - radius);
+        let (x1, y1) = (x + radius, y + radius);
+        bounds = Some(match bounds {
+            Some(b) => (b.0.min(x0), b.1.min(y0), b.2.max(x1), b.3.max(y1)),
+            None => (x0, y0, x1, y1),
+        });
+    };
+
+    // Hạt lấp lánh: quầng ngoài cùng là core * 4.4
+    for particle in scene.particles.iter() {
+        include(particle.x, particle.y, particle.size * 4.4 + 6.0);
+    }
+    if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON && CURSOR_VISIBLE.load(Ordering::Relaxed) {
+        // Dải sáng: nửa bề rộng quầng lớn nhất (48/2) + làm mượt + khử răng cưa,
+        // và quầng đầu dải (bán kính 30)
+        for point in scene.trail.iter() {
+            include(point.x, point.y, 40.0);
+        }
+    }
+
+    if let Some(bounds) = bounds {
+        if scene.paint_history.len() >= PAINT_HISTORY_FRAMES {
+            scene.paint_history.remove(0);
+        }
+        scene.paint_history.push(bounds);
+    }
+
+    let mut dirty: Option<(f64, f64, f64, f64)> = None;
+    for bounds in scene.paint_history.iter() {
+        dirty = union_bounds(dirty, Some(*bounds));
+    }
+    scene.dirty_bounds = dirty.map(|b| (b.0 - 3.0, b.1 - 3.0, b.2 + 3.0, b.3 + 3.0));
+}
+
 /// Mô phỏng một frame (gọi từ timer trên main thread, mỗi frame đúng một lần).
 fn tick() {
     let now = Instant::now();
@@ -916,6 +991,8 @@ fn tick() {
         scene.trail.clear();
         scene.head_init = false;
         scene.idle_secs = 0.0;
+        // Dải sáng vừa bị xoá -> vẫn phải vẽ lại vùng cũ một lần
+        update_dirty_bounds(&mut scene);
         return;
     }
 
@@ -933,6 +1010,7 @@ fn tick() {
         scene.trail.clear();
         scene.head_init = false;
         scene.idle_secs = 0.0;
+        update_dirty_bounds(&mut scene);
         return;
     }
 
@@ -949,6 +1027,13 @@ fn tick() {
         scene.head_init = true;
         samples.clear();
     }
+
+    // Vừa dừng chuột -> vẽ lại toàn bộ một lần cho chắc, dọn mọi pixel còn sót
+    let moving = !samples.is_empty();
+    if scene.was_moving && !moving {
+        scene.full_refresh = true;
+    }
+    scene.was_moving = moving;
 
     if samples.is_empty() {
         scene.idle_secs += dt;
@@ -1007,6 +1092,8 @@ fn tick() {
             });
         }
     }
+
+    update_dirty_bounds(&mut scene);
 }
 
 fn current_cg_context_ref() -> Option<CGContextRef> {
@@ -1061,7 +1148,7 @@ fn fill_oval(cx: f64, cy: f64, radius: f64, r: f64, g: f64, b: f64, alpha: f64) 
     context.fill_ellipse_in_rect(rect);
 }
 
-extern "C" fn draw_rect(this: &Object, _sel: Sel, _rect: NSRect) {
+extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
     unsafe {
         // Mỗi màn hình có một cửa sổ riêng. Hạt lưu ở toạ độ toàn cục (gốc là góc
         // dưới-trái màn hình chính), nên phải trừ gốc cửa sổ này đi mới vẽ đúng chỗ.
@@ -1076,13 +1163,19 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, _rect: NSRect) {
         let max_x = frame.size.width;
         let max_y = frame.size.height;
 
-        // Cửa sổ trong suốt: tự xoá sạch vùng vẽ trước khi vẽ frame mới. Không có
-        // bước này, pixel của frame trước (nhất là khi rê chuột rất nhanh) sẽ nằm
-        // lại trên màn hình thành "vệt dính" cho tới khi có gì đó vẽ đè lên.
+        // Cửa sổ trong suốt: tự xoá sạch đúng vùng sắp vẽ trước khi vẽ frame mới.
+        // Vùng này đã gộp nội dung frame trước, nên pixel cũ không thể sót lại
+        // thành "vệt dính" khi rê chuột nhanh.
         if let Some(context) = current_cg_context_ref() {
             CGContextClearRect(
                 context,
-                CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(max_x, max_y)),
+                CGRect::new(
+                    &CGPoint::new(dirty_rect.origin.x, dirty_rect.origin.y),
+                    &CGSize::new(
+                        dirty_rect.size.width.max(1.0),
+                        dirty_rect.size.height.max(1.0),
+                    ),
+                ),
             );
         }
 
@@ -1302,22 +1395,53 @@ fn main() {
             }
             tick();
 
-            let idle = match get_scene().lock() {
-                Ok(scene) => scene.idle_secs > 0.12,
-                Err(poisoned) => poisoned.into_inner().idle_secs > 0.12,
+            let (dirty, idle) = match get_scene().lock() {
+                Ok(scene) => (scene.dirty_bounds, scene.idle_secs > 0.12),
+                Err(poisoned) => {
+                    let scene = poisoned.into_inner();
+                    (scene.dirty_bounds, scene.idle_secs > 0.12)
+                }
             };
 
             // Chuột đứng yên thì chỉ cần 30 fps cho các đốm lấp lánh -> nhẹ CPU
             static PARITY: AtomicUsize = AtomicUsize::new(0);
-            if idle && PARITY.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
+            let skip_frame = idle && PARITY.fetch_add(1, Ordering::Relaxed) % 2 == 1;
+            if skip_frame {
                 return;
             }
 
-            // Vẽ lại toàn bộ overlay. Invalidate từng phần trên cửa sổ trong suốt
-            // sẽ để lại vệt cũ khi trail dài/đổi hướng đột ngột.
-            for (view, _, _) in &views {
-                let v = *view as id;
-                let _: () = msg_send![v, setNeedsDisplay: YES];
+            let full_refresh = match get_scene().lock() {
+                Ok(mut scene) => {
+                    let full = scene.full_refresh;
+                    scene.full_refresh = false;
+                    full
+                }
+                Err(poisoned) => {
+                    let mut scene = poisoned.into_inner();
+                    let full = scene.full_refresh;
+                    scene.full_refresh = false;
+                    full
+                }
+            };
+
+            if full_refresh {
+                for (view, _, _) in &views {
+                    let v = *view as id;
+                    let _: () = msg_send![v, setNeedsDisplay: YES];
+                }
+                return;
+            }
+
+            // Chỉ vẽ lại vùng có hiệu ứng (dải sáng + quầng + hạt). `dirty_bounds`
+            // đã gộp vùng của 45 frame gần nhất nên pixel cũ cũng được xoá theo.
+            if let Some((x0, y0, x1, y1)) = dirty {
+                let size = NSSize::new((x1 - x0).max(1.0), (y1 - y0).max(1.0));
+                for (view, offset_x, offset_y) in &views {
+                    let v = *view as id;
+                    let rect =
+                        NSRect::new(NSPoint::new(x0 - *offset_x, y0 - *offset_y), size);
+                    let _: () = msg_send![v, setNeedsDisplayInRect: rect];
+                }
             }
         })
         .copy();
