@@ -19,6 +19,7 @@ use objc::declare::ClassDecl;
 use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use rand::Rng;
+use std::collections::HashSet;
 use std::f64::consts::TAU;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -120,6 +121,13 @@ const EFFECT_FIREWORKS: u8 = 0;
 const EFFECT_NEON: u8 = 1;
 
 static EFFECT: AtomicU8 = AtomicU8::new(EFFECT_FIREWORKS);
+
+// ---------- Skin của dải neon ----------
+
+const SKIN_CLASSIC: u8 = 0;
+const SKIN_PIXEL_LOVE: u8 = 1;
+
+static SKIN: AtomicU8 = AtomicU8::new(SKIN_CLASSIC);
 /// Con trỏ có đang được hiển thị không (video fullscreen sẽ ẩn con trỏ)
 static CURSOR_VISIBLE: AtomicBool = AtomicBool::new(true);
 
@@ -167,6 +175,31 @@ fn load_effect_preference() {
             };
             EFFECT.store(effect, Ordering::Relaxed);
         }
+    }
+}
+
+fn load_skin_preference() {
+    unsafe {
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("Skin");
+        let stored: id = msg_send![defaults, objectForKey: key];
+        if stored != nil {
+            let value: i64 = msg_send![defaults, integerForKey: key];
+            let skin = if value == SKIN_PIXEL_LOVE as i64 {
+                SKIN_PIXEL_LOVE
+            } else {
+                SKIN_CLASSIC
+            };
+            SKIN.store(skin, Ordering::Relaxed);
+        }
+    }
+}
+
+fn skin_index() -> i64 {
+    if SKIN.load(Ordering::Relaxed) == SKIN_PIXEL_LOVE {
+        1
+    } else {
+        0
     }
 }
 
@@ -498,6 +531,28 @@ extern "C" fn change_effect(_this: &Object, _sel: Sel, sender: id) {
     }
 }
 
+extern "C" fn change_skin(_this: &Object, _sel: Sel, sender: id) {
+    unsafe {
+        let index: i64 = msg_send![sender, indexOfSelectedItem];
+        let skin = if index == 1 {
+            SKIN_PIXEL_LOVE
+        } else {
+            SKIN_CLASSIC
+        };
+        SKIN.store(skin, Ordering::Relaxed);
+
+        // Đổi skin thì dọn trail để không lẫn hai kiểu vẽ
+        if let Ok(mut scene) = get_scene().lock() {
+            scene.trail.clear();
+            scene.head_init = false;
+        }
+
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("Skin");
+        let _: () = msg_send![defaults, setInteger: skin as i64 forKey: key];
+    }
+}
+
 extern "C" fn quit_app(_this: &Object, _sel: Sel, _sender: id) {
     unsafe {
         let _: () = msg_send![NSApp(), terminate: nil];
@@ -524,6 +579,10 @@ fn register_controller_class() -> *const Class {
             change_effect as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
+            sel!(changeSkin:),
+            change_skin as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
             sel!(quitApp:),
             quit_app as extern "C" fn(&Object, Sel, id),
         );
@@ -532,7 +591,7 @@ fn register_controller_class() -> *const Class {
 }
 
 unsafe fn build_settings_window(controller: id) -> id {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 252.0));
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 292.0));
     let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
         frame,
         NSWindowStyleMask::NSTitledWindowMask | NSWindowStyleMask::NSClosableWindowMask,
@@ -548,18 +607,18 @@ unsafe fn build_settings_window(controller: id) -> id {
     let title: id = msg_send![class!(NSTextField), labelWithString: nsstring("Mac Fireworks")];
     let font: id = msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64];
     let _: () = msg_send![title, setFont: font];
-    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 206.0), NSSize::new(280.0, 20.0))];
+    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 246.0), NSSize::new(280.0, 20.0))];
     let _: () = msg_send![content, addSubview: title];
 
     // Chọn hiệu ứng: Fireworks (click) hay Neon trail (theo con trỏ)
     let effect_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Effect")];
-    let _: () = msg_send![effect_label, setFrame: NSRect::new(NSPoint::new(20.0, 176.0), NSSize::new(70.0, 18.0))];
+    let _: () = msg_send![effect_label, setFrame: NSRect::new(NSPoint::new(20.0, 216.0), NSSize::new(70.0, 18.0))];
     let _: () = msg_send![content, addSubview: effect_label];
 
     let popup: id = msg_send![class!(NSPopUpButton), alloc];
     let popup: id = msg_send![
         popup,
-        initWithFrame: NSRect::new(NSPoint::new(100.0, 170.0), NSSize::new(200.0, 26.0))
+        initWithFrame: NSRect::new(NSPoint::new(100.0, 210.0), NSSize::new(200.0, 26.0))
         pullsDown: NO
     ];
     let _: () = msg_send![popup, addItemWithTitle: nsstring("Fireworks")];
@@ -569,6 +628,24 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![popup, setAction: sel!(changeEffect:)];
     let _: () = msg_send![content, addSubview: popup];
 
+    // Skin của dải neon: Classic (dải neon mượt) hay Pixel love (tim pixel)
+    let skin_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Skin")];
+    let _: () = msg_send![skin_label, setFrame: NSRect::new(NSPoint::new(20.0, 182.0), NSSize::new(70.0, 18.0))];
+    let _: () = msg_send![content, addSubview: skin_label];
+
+    let skin_popup: id = msg_send![class!(NSPopUpButton), alloc];
+    let skin_popup: id = msg_send![
+        skin_popup,
+        initWithFrame: NSRect::new(NSPoint::new(100.0, 176.0), NSSize::new(200.0, 26.0))
+        pullsDown: NO
+    ];
+    let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Classic")];
+    let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Pixel love")];
+    let _: () = msg_send![skin_popup, selectItemAtIndex: skin_index()];
+    let _: () = msg_send![skin_popup, setTarget: controller];
+    let _: () = msg_send![skin_popup, setAction: sel!(changeSkin:)];
+    let _: () = msg_send![content, addSubview: skin_popup];
+
     let checkbox: id = msg_send![
         class!(NSButton),
         checkboxWithTitle: nsstring("Play firework sound on click")
@@ -577,11 +654,11 @@ unsafe fn build_settings_window(controller: id) -> id {
     ];
     let state: i64 = if sound_enabled() { 1 } else { 0 };
     let _: () = msg_send![checkbox, setState: state];
-    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 140.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 146.0), NSSize::new(280.0, 22.0))];
     let _: () = msg_send![content, addSubview: checkbox];
 
     let volume_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Volume")];
-    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 112.0), NSSize::new(120.0, 18.0))];
+    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 118.0), NSSize::new(120.0, 18.0))];
     let _: () = msg_send![content, addSubview: volume_label];
 
     // Phần trăm âm lượng hiện tại, cập nhật ngay khi kéo slider
@@ -592,12 +669,12 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![percent, setAlignment: 2i64];
     let percent_color: id = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![percent, setTextColor: percent_color];
-    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 112.0), NSSize::new(60.0, 18.0))];
+    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 118.0), NSSize::new(60.0, 18.0))];
     let _: () = msg_send![content, addSubview: percent];
     let _ = VOLUME_LABEL.set(percent as usize);
 
     let slider: id = msg_send![class!(NSSlider), alloc];
-    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(20.0, 86.0), NSSize::new(280.0, 24.0))];
+    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(20.0, 92.0), NSSize::new(280.0, 24.0))];
     let _: () = msg_send![slider, setMinValue: 0.0f64];
     let _: () = msg_send![slider, setMaxValue: 1.0f64];
     let _: () = msg_send![slider, setDoubleValue: sound_volume() as f64];
@@ -607,7 +684,7 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![content, addSubview: slider];
 
     let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Click fires a firework; Neon trail follows your cursor.")];
-    let _: () = msg_send![hint, setFrame: NSRect::new(NSPoint::new(20.0, 58.0), NSSize::new(280.0, 18.0))];
+    let _: () = msg_send![hint, setFrame: NSRect::new(NSPoint::new(20.0, 66.0), NSSize::new(280.0, 18.0))];
     let color: id = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![hint, setTextColor: color];
     let _: () = msg_send![content, addSubview: hint];
@@ -618,7 +695,7 @@ unsafe fn build_settings_window(controller: id) -> id {
         target: controller
         action: sel!(quitApp:)
     ];
-    let _: () = msg_send![quit, setFrame: NSRect::new(NSPoint::new(20.0, 14.0), NSSize::new(170.0, 30.0))];
+    let _: () = msg_send![quit, setFrame: NSRect::new(NSPoint::new(20.0, 20.0), NSSize::new(170.0, 30.0))];
     let _: () = msg_send![content, addSubview: quit];
 
     window as id
@@ -958,6 +1035,161 @@ fn update_dirty_bounds(scene: &mut Scene) {
     scene.dirty_bounds = dirty.map(|b| (b.0 - 3.0, b.1 - 3.0, b.2 + 3.0, b.3 + 3.0));
 }
 
+/// Màu skin "Pixel love": hồng đậm ở đuôi -> hồng nhạt ở đầu.
+fn pixel_love_color(t: f64) -> (f64, f64, f64) {
+    let t = t.clamp(0.0, 1.0);
+    (1.0, 0.18 + 0.45 * t, 0.55 + 0.35 * t)
+}
+
+/// Bitmap trái tim 7x6 cho skin pixel (1 = tô màu).
+const PIXEL_HEART: [u8; 6] = [
+    0b0110110, 0b1111111, 0b1111111, 0b0111110, 0b0011100, 0b0001000,
+];
+
+unsafe fn draw_pixel_heart(
+    context: &CGContext,
+    cx: f64,
+    cy: f64,
+    cell: f64,
+    r: f64,
+    g: f64,
+    b: f64,
+    alpha: f64,
+) {
+    context.set_rgb_fill_color(r, g, b, alpha);
+
+    let width = 7.0 * cell;
+    let height = 6.0 * cell;
+    let mut rects: Vec<CGRect> = Vec::with_capacity(30);
+    for (row, bits) in PIXEL_HEART.iter().enumerate() {
+        for col in 0..7 {
+            if bits & (1 << (6 - col)) == 0 {
+                continue;
+            }
+            let x = cx - width * 0.5 + col as f64 * cell;
+            let y = cy - height * 0.5 + (5 - row) as f64 * cell;
+            rects.push(CGRect::new(
+                &CGPoint::new(x, y),
+                &CGSize::new((cell - 0.7).max(1.0), (cell - 0.7).max(1.0)),
+            ));
+        }
+    }
+    context.fill_rects(&rects);
+}
+
+/// Skin "Pixel love": dải gồm các ô vuông hồng snap về lưới 6 px, rải trái tim
+/// pixel dọc theo đường đi, đầu dải là một trái tim lớn.
+unsafe fn draw_pixel_trail(points: &[(f64, f64)]) {
+    let count = points.len();
+    if count < 2 {
+        return;
+    }
+    let Some(context) = current_cg_context() else {
+        return;
+    };
+
+    const CELL: f64 = 6.0;
+    const ALPHA: [f64; 4] = [0.45, 0.65, 0.82, 0.95];
+
+    // Mỗi điểm trải ô vuông theo pháp tuyến -> cả dải thành một băng pixel dày,
+    // snap về lưới 6 px nên nhìn đúng chất 8-bit.
+    let mut buckets: [Vec<(f64, f64)>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut seen: HashSet<(i64, i64)> = HashSet::with_capacity(800);
+    for i in 0..count {
+        let t = i as f64 / (count - 1) as f64;
+        let (nx, ny) = ribbon_normal(points, i);
+        let half = (1.0 + 1.6 * t) * CELL;
+        let lanes = (half / CELL).round().max(0.0) as i64;
+        for lane in -lanes..=lanes {
+            let px = points[i].0 + nx * lane as f64 * CELL;
+            let py = points[i].1 + ny * lane as f64 * CELL;
+            let cx = (px / CELL).round() as i64;
+            let cy = (py / CELL).round() as i64;
+            if !seen.insert((cx, cy)) {
+                continue;
+            }
+            let level = ((t * 3.99) as usize).min(3);
+            buckets[level].push((cx as f64 * CELL, cy as f64 * CELL));
+        }
+    }
+
+    // Quầng hồng mờ phía sau để dải pixel nổi trên mọi nền
+    let glow: Vec<CGRect> = buckets
+        .iter()
+        .flat_map(|cells| cells.iter().step_by(2))
+        .map(|(x, y)| {
+            let size = CELL * 2.2;
+            CGRect::new(
+                &CGPoint::new(x - size * 0.5, y - size * 0.5),
+                &CGSize::new(size, size),
+            )
+        })
+        .collect();
+    if !glow.is_empty() {
+        context.set_rgb_fill_color(1.0, 0.42, 0.78, 0.07);
+        context.fill_rects(&glow);
+    }
+
+    for (level, cells) in buckets.iter().enumerate() {
+        if cells.is_empty() {
+            continue;
+        }
+        let t = (level as f64 + 0.5) / 4.0;
+        let (r, g, b) = pixel_love_color(t);
+        let size = CELL - 0.8;
+        context.set_rgb_fill_color(r, g, b, ALPHA[level]);
+        let rects: Vec<CGRect> = cells
+            .iter()
+            .map(|(x, y)| {
+                CGRect::new(
+                    &CGPoint::new(x - size * 0.5, y - size * 0.5),
+                    &CGSize::new(size, size),
+                )
+            })
+            .collect();
+        context.fill_rects(&rects);
+    }
+
+    // Trái tim hồng nhạt rải dọc dải
+    let step = 20;
+    let mut index = step;
+    while index < count {
+        let t = index as f64 / (count - 1) as f64;
+        let (x, y) = points[index];
+        draw_pixel_heart(
+            &context,
+            (x / CELL).round() * CELL,
+            (y / CELL).round() * CELL,
+            2.8 + 0.8 * t,
+            1.0,
+            0.96,
+            1.0,
+            0.6 + 0.32 * t,
+        );
+        index += step;
+    }
+
+    // Đầu dải: trái tim lớn ngay tại con trỏ
+    if let Some((x, y)) = points.last().copied() {
+        draw_pixel_heart(
+            &context,
+            (x / CELL).round() * CELL,
+            (y / CELL).round() * CELL,
+            3.6,
+            1.0,
+            0.98,
+            1.0,
+            0.95,
+        );
+        let (r, g, b) = pixel_love_color(1.0);
+        context.set_rgb_fill_color(r, g, b, 0.10);
+        context.fill_ellipse_in_rect(CGRect::new(
+            &CGPoint::new(x - 24.0, y - 24.0),
+            &CGSize::new(48.0, 48.0),
+        ));
+    }
+}
+
 /// Mô phỏng một frame (gọi từ timer trên main thread, mỗi frame đúng một lần).
 fn tick() {
     let now = Instant::now();
@@ -1229,19 +1461,24 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
                 smooth.push(((a.0 + 2.0 * b.0 + c.0) / 4.0, (a.1 + 2.0 * b.1 + c.1) / 4.0));
             }
 
-            let (r, g, b) = neon_color(scene.hue_phase);
-            // Nhiều lớp, mỗi lớp là MỘT path kín: quầng -> thân -> ruột trắng
-            fill_ribbon(&smooth, 48.0, r, g, b, 0.07);
-            fill_ribbon(&smooth, 30.0, r, g, b, 0.14);
-            fill_ribbon(&smooth, 20.0, r, g, b, 0.78);
-            fill_ribbon(&smooth, 8.0, 1.0, 1.0, 1.0, 0.55);
+            if SKIN.load(Ordering::Relaxed) == SKIN_PIXEL_LOVE {
+                draw_pixel_trail(&smooth);
+            } else {
+                let (r, g, b) = neon_color(scene.hue_phase);
+                // Nhiều lớp, mỗi lớp là MỘT path kín: quầng -> thân -> ruột trắng
+                fill_ribbon(&smooth, 48.0, r, g, b, 0.07);
+                fill_ribbon(&smooth, 30.0, r, g, b, 0.14);
+                fill_ribbon(&smooth, 20.0, r, g, b, 0.78);
+                fill_ribbon(&smooth, 8.0, 1.0, 1.0, 1.0, 0.55);
 
-            // Đầu dải sáng: quầng neon nhấp nháy tại con trỏ
-            if let Some((hx, hy)) = smooth.last().copied() {
-                let pulse = 0.55 + 0.45 * ((scene.hue_phase * TAU * 3.0).sin() * 0.5 + 0.5);
-                fill_oval(hx, hy, 30.0, r, g, b, 0.05 * pulse);
-                fill_oval(hx, hy, 15.0, r, g, b, 0.12 * pulse);
-                fill_oval(hx, hy, 7.0, 1.0, 1.0, 1.0, 0.6 * pulse);
+                // Đầu dải sáng: quầng neon nhấp nháy tại con trỏ
+                if let Some((hx, hy)) = smooth.last().copied() {
+                    let pulse =
+                        0.55 + 0.45 * ((scene.hue_phase * TAU * 3.0).sin() * 0.5 + 0.5);
+                    fill_oval(hx, hy, 30.0, r, g, b, 0.05 * pulse);
+                    fill_oval(hx, hy, 15.0, r, g, b, 0.12 * pulse);
+                    fill_oval(hx, hy, 7.0, 1.0, 1.0, 1.0, 0.6 * pulse);
+                }
             }
         }
     }
@@ -1313,6 +1550,7 @@ fn main() {
         // Tiếng click, hiệu ứng, panel settings và icon trên menu bar
         load_sound_preference();
         load_effect_preference();
+        load_skin_preference();
         load_sounds();
 
         // Quả pháo chào ngay khi mở app (chỉ ở chế độ Fireworks)
