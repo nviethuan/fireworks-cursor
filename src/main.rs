@@ -128,6 +128,7 @@ const SKIN_CLASSIC: u8 = 0;
 const SKIN_PIXEL_LOVE: u8 = 1;
 const SKIN_CALLIGRAPHY: u8 = 2;
 const SKIN_BAT: u8 = 3;
+const SKIN_NORTHERN_LIGHTS: u8 = 4;
 
 static SKIN: AtomicU8 = AtomicU8::new(SKIN_CLASSIC);
 /// Con trỏ có đang được hiển thị không (video fullscreen sẽ ẩn con trỏ)
@@ -191,6 +192,7 @@ fn load_skin_preference() {
                 1 => SKIN_PIXEL_LOVE,
                 2 => SKIN_CALLIGRAPHY,
                 3 => SKIN_BAT,
+                4 => SKIN_NORTHERN_LIGHTS,
                 _ => SKIN_CLASSIC,
             };
             SKIN.store(skin, Ordering::Relaxed);
@@ -203,6 +205,7 @@ fn skin_index() -> i64 {
         SKIN_PIXEL_LOVE => 1,
         SKIN_CALLIGRAPHY => 2,
         SKIN_BAT => 3,
+        SKIN_NORTHERN_LIGHTS => 4,
         _ => 0,
     }
 }
@@ -542,6 +545,7 @@ extern "C" fn change_skin(_this: &Object, _sel: Sel, sender: id) {
             1 => SKIN_PIXEL_LOVE,
             2 => SKIN_CALLIGRAPHY,
             3 => SKIN_BAT,
+            4 => SKIN_NORTHERN_LIGHTS,
             _ => SKIN_CLASSIC,
         };
         SKIN.store(skin, Ordering::Relaxed);
@@ -648,6 +652,7 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Pixel love")];
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Calligraphy brush")];
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Bat blade")];
+    let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Northern lights")];
     let _: () = msg_send![skin_popup, selectItemAtIndex: skin_index()];
     let _: () = msg_send![skin_popup, setTarget: controller];
     let _: () = msg_send![skin_popup, setAction: sel!(changeSkin:)];
@@ -1430,6 +1435,60 @@ unsafe fn draw_bat_trail(points: &[(f64, f64)], phase: f64) {
     }
 }
 
+/// Skin "Northern lights": nhiều dải cực quang chồng nhau (xanh lá -> teal ->
+/// cyan -> tím), mép lượn sóng như rèm sáng, thêm các vệt shimmer dọc dải.
+unsafe fn draw_aurora_trail(points: &[(f64, f64)], phase: f64) {
+    let count = points.len();
+    if count < 2 {
+        return;
+    }
+    let Some(context) = current_cg_context() else {
+        return;
+    };
+
+    // (r, g, b, tỉ lệ bề rộng, alpha)
+    const LAYERS: [(f64, f64, f64, f64, f64); 4] = [
+        (0.10, 1.00, 0.45, 3.0, 0.30),
+        (0.10, 0.85, 0.65, 1.8, 0.40),
+        (0.45, 0.35, 1.00, 1.0, 0.45),
+        (0.60, 1.00, 0.85, 0.40, 0.70),
+    ];
+
+    for (layer, (r, g, b, scale, alpha)) in LAYERS.iter().enumerate() {
+        let layer_phase = phase + layer as f64 * 1.3;
+        fill_brush_layer(
+            &context,
+            points,
+            |i, t| {
+                let wave = 0.62 + 0.5 * (i as f64 * 0.26 + layer_phase).sin();
+                (2.5 + 9.0 * t) * wave * scale * 0.5
+            },
+            *r,
+            *g,
+            *b,
+            *alpha,
+        );
+    }
+
+    // Vệt shimmer chạy dọc dải
+    let mut index = 8;
+    while index < count {
+        let t = index as f64 / (count - 1) as f64;
+        let shimmer = (phase * 2.0 + index as f64 * 0.6).sin();
+        if shimmer > 0.55 {
+            let (nx, ny) = ribbon_normal(points, index);
+            let half = (2.5 + 9.0 * t) * 1.5;
+            context.set_rgb_stroke_color(0.85, 1.0, 0.92, 0.22 * shimmer);
+            context.set_line_width(2.0);
+            context.begin_path();
+            context.move_to_point(points[index].0 - ny * half, points[index].1 + nx * half);
+            context.add_line_to_point(points[index].0 + ny * half, points[index].1 - nx * half);
+            context.stroke_path();
+        }
+        index += 11;
+    }
+}
+
 /// Mô phỏng một frame (gọi từ timer trên main thread, mỗi frame đúng một lần).
 fn tick() {
     let now = Instant::now();
@@ -1708,6 +1767,8 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
                 draw_brush_trail(&smooth);
             } else if skin == SKIN_BAT {
                 draw_bat_trail(&smooth, scene.hue_phase * TAU * 3.0);
+            } else if skin == SKIN_NORTHERN_LIGHTS {
+                draw_aurora_trail(&smooth, scene.hue_phase * TAU * 2.0);
             } else {
                 let (r, g, b) = neon_color(scene.hue_phase);
                 // Nhiều lớp, mỗi lớp là MỘT path kín: quầng -> thân -> ruột trắng
