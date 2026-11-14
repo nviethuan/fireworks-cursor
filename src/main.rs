@@ -113,7 +113,14 @@ fn accessibility_granted() -> bool {
 
 static SOUND_ENABLED: AtomicBool = AtomicBool::new(true);
 static SOUND_PENDING: AtomicBool = AtomicBool::new(false);
-static SOUND_POOL: OnceLock<Vec<usize>> = OnceLock::new();
+/// Pool phát cho từng loại âm thanh: mỗi loại có 4 bản để bấm liên tiếp không cắt nhau
+static SOUND_POOLS: OnceLock<Vec<Vec<usize>>> = OnceLock::new();
+/// Loại âm thanh đang chọn (chỉ số trong SOUND_KINDS)
+static SOUND_KIND: AtomicU8 = AtomicU8::new(0);
+
+/// Tên file trong bundle, thứ tự này cũng là thứ tự trong popup chọn âm thanh
+const SOUND_KINDS: [&str; 5] = ["click", "pop", "chime", "firework", "boom"];
+const SOUND_LABELS: [&str; 5] = ["Click", "Pop", "Chime", "Firework", "Boom"];
 static SOUND_NEXT: AtomicUsize = AtomicUsize::new(0);
 static SOUND_VOLUME_BITS: AtomicU32 = AtomicU32::new(0.45f32.to_bits());
 
@@ -210,6 +217,24 @@ fn load_skin_preference() {
             SKIN.store(skin, Ordering::Relaxed);
         }
     }
+}
+
+/// Đọc loại âm thanh đã chọn lần trước (key "Sound")
+fn load_sound_kind_preference() {
+    unsafe {
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("Sound");
+        let stored: id = msg_send![defaults, objectForKey: key];
+        if stored != nil {
+            let value: i64 = msg_send![defaults, integerForKey: key];
+            let kind = value.clamp(0, SOUND_KINDS.len() as i64 - 1) as u8;
+            SOUND_KIND.store(kind, Ordering::Relaxed);
+        }
+    }
+}
+
+fn sound_index() -> i64 {
+    SOUND_KIND.load(Ordering::Relaxed) as i64
 }
 
 fn skin_index() -> i64 {
@@ -417,51 +442,59 @@ unsafe fn builtin_output_uid() -> Option<id> {
 
 /// Nạp sẵn vài bản sao để click liên tiếp vẫn phát, không cắt tiếng của nhau.
 fn load_sounds() {
-    let mut pool: Vec<usize> = Vec::with_capacity(4);
+    let mut pools: Vec<Vec<usize>> = Vec::with_capacity(SOUND_KINDS.len());
     unsafe {
         let bundle: id = msg_send![class!(NSBundle), mainBundle];
-        let path: id = msg_send![
-            bundle,
-            pathForResource: nsstring("click")
-            ofType: nsstring("wav")
-        ];
-        if path == nil {
-            eprintln!("Không thấy click.wav trong bundle: app sẽ chạy không tiếng.");
-        } else {
-            // Ghim phát ra loa trong của máy. Nếu để NSSound tự chọn, nó đi theo đường
-            // "alert sound" và có thể ra cả Bluetooth/AirPlay — mỗi lần đánh thức thiết bị
-            // ngoài là một lần macOS hiện HUD âm lượng.
-            let device_uid = match builtin_output_uid() {
-                Some(uid) => Some(uid),
-                None => {
-                    eprintln!("Không tìm thấy loa trong của máy: phát ra thiết bị ra mặc định.");
-                    default_output_device_uid()
-                }
-            };
-            if device_uid.is_none() {
-                eprintln!("Không đọc được thiết bị âm thanh: dùng đường phát mặc định.");
+        // Ghim phát ra loa trong của máy. Nếu để NSSound tự chọn, nó đi theo đường
+        // "alert sound" và có thể ra cả Bluetooth/AirPlay — mỗi lần đánh thức thiết bị
+        // ngoài là một lần macOS hiện HUD âm lượng.
+        let device_uid = match builtin_output_uid() {
+            Some(uid) => Some(uid),
+            None => {
+                eprintln!("Không tìm thấy loa trong của máy: phát ra thiết bị ra mặc định.");
+                default_output_device_uid()
             }
-            for _ in 0..4 {
-                let sound: id = msg_send![class!(NSSound), alloc];
-                let sound: id = msg_send![sound, initWithContentsOfFile: path byReference: YES];
-                if sound != nil {
-                    let _: () = msg_send![sound, setVolume: sound_volume()];
-                    if let Some(uid) = device_uid {
-                        let _: () = msg_send![sound, setPlaybackDeviceIdentifier: uid];
+        };
+        if device_uid.is_none() {
+            eprintln!("Không đọc được thiết bị âm thanh: dùng đường phát mặc định.");
+        }
+
+        for name in SOUND_KINDS {
+            let path: id = msg_send![
+                bundle,
+                pathForResource: nsstring(name)
+                ofType: nsstring("wav")
+            ];
+            let mut pool: Vec<usize> = Vec::with_capacity(4);
+            if path == nil {
+                eprintln!("Không thấy {name}.wav trong bundle.");
+            } else {
+                for _ in 0..4 {
+                    let sound: id = msg_send![class!(NSSound), alloc];
+                    let sound: id = msg_send![sound, initWithContentsOfFile: path byReference: YES];
+                    if sound != nil {
+                        let _: () = msg_send![sound, setVolume: sound_volume()];
+                        if let Some(uid) = device_uid {
+                            let _: () = msg_send![sound, setPlaybackDeviceIdentifier: uid];
+                        }
+                        pool.push(sound as usize);
                     }
-                    pool.push(sound as usize);
                 }
             }
+            pools.push(pool);
         }
     }
-    SOUND_POOL.get_or_init(|| pool);
+    SOUND_POOLS.get_or_init(|| pools);
 }
 
 fn play_click_sound() {
     if !sound_enabled() {
         return;
     }
-    let Some(pool) = SOUND_POOL.get() else {
+    let Some(pools) = SOUND_POOLS.get() else {
+        return;
+    };
+    let Some(pool) = pools.get(SOUND_KIND.load(Ordering::Relaxed) as usize) else {
         return;
     };
     if pool.is_empty() {
@@ -510,9 +543,11 @@ extern "C" fn change_volume(_this: &Object, _sel: Sel, sender: id) {
     unsafe {
         let value: f64 = msg_send![sender, doubleValue];
         let volume = set_sound_volume(value as f32);
-        if let Some(pool) = SOUND_POOL.get() {
-            for sound in pool {
-                let _: () = msg_send![*sound as id, setVolume: volume];
+        if let Some(pools) = SOUND_POOLS.get() {
+            for pool in pools {
+                for sound in pool {
+                    let _: () = msg_send![*sound as id, setVolume: volume];
+                }
             }
         }
         if let Some(label) = VOLUME_LABEL.get() {
@@ -556,6 +591,21 @@ extern "C" fn change_effect(_this: &Object, _sel: Sel, sender: id) {
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
         let key = nsstring("Effect");
         let _: () = msg_send![defaults, setInteger: effect as i64 forKey: key];
+    }
+}
+
+extern "C" fn change_sound(_this: &Object, _sel: Sel, sender: id) {
+    unsafe {
+        let index: i64 = msg_send![sender, indexOfSelectedItem];
+        let kind = index.clamp(0, SOUND_KINDS.len() as i64 - 1) as u8;
+        SOUND_KIND.store(kind, Ordering::Relaxed);
+
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("Sound");
+        let _: () = msg_send![defaults, setInteger: kind as i64 forKey: key];
+
+        // Nghe thử luôn để biết đã chọn đúng âm thanh nào
+        play_click_sound();
     }
 }
 
@@ -609,6 +659,10 @@ fn register_controller_class() -> *const Class {
             change_effect as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
+            sel!(changeSound:),
+            change_sound as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
             sel!(changeSkin:),
             change_skin as extern "C" fn(&Object, Sel, id),
         );
@@ -621,7 +675,7 @@ fn register_controller_class() -> *const Class {
 }
 
 unsafe fn build_settings_window(controller: id) -> id {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 292.0));
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 326.0));
     let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
         frame,
         NSWindowStyleMask::NSTitledWindowMask | NSWindowStyleMask::NSClosableWindowMask,
@@ -637,18 +691,18 @@ unsafe fn build_settings_window(controller: id) -> id {
     let title: id = msg_send![class!(NSTextField), labelWithString: nsstring("Mac Fireworks")];
     let font: id = msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64];
     let _: () = msg_send![title, setFont: font];
-    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 246.0), NSSize::new(280.0, 20.0))];
+    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 280.0), NSSize::new(280.0, 20.0))];
     let _: () = msg_send![content, addSubview: title];
 
     // Chọn hiệu ứng: Fireworks (click) hay Neon trail (theo con trỏ)
     let effect_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Effect")];
-    let _: () = msg_send![effect_label, setFrame: NSRect::new(NSPoint::new(20.0, 216.0), NSSize::new(70.0, 18.0))];
+    let _: () = msg_send![effect_label, setFrame: NSRect::new(NSPoint::new(20.0, 248.0), NSSize::new(70.0, 18.0))];
     let _: () = msg_send![content, addSubview: effect_label];
 
     let popup: id = msg_send![class!(NSPopUpButton), alloc];
     let popup: id = msg_send![
         popup,
-        initWithFrame: NSRect::new(NSPoint::new(100.0, 210.0), NSSize::new(200.0, 26.0))
+        initWithFrame: NSRect::new(NSPoint::new(100.0, 242.0), NSSize::new(200.0, 26.0))
         pullsDown: NO
     ];
     let _: () = msg_send![popup, addItemWithTitle: nsstring("Fireworks")];
@@ -660,13 +714,13 @@ unsafe fn build_settings_window(controller: id) -> id {
 
     // Skin của dải neon: Classic (dải neon mượt) hay Pixel love (tim pixel)
     let skin_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Skin")];
-    let _: () = msg_send![skin_label, setFrame: NSRect::new(NSPoint::new(20.0, 182.0), NSSize::new(70.0, 18.0))];
+    let _: () = msg_send![skin_label, setFrame: NSRect::new(NSPoint::new(20.0, 210.0), NSSize::new(70.0, 18.0))];
     let _: () = msg_send![content, addSubview: skin_label];
 
     let skin_popup: id = msg_send![class!(NSPopUpButton), alloc];
     let skin_popup: id = msg_send![
         skin_popup,
-        initWithFrame: NSRect::new(NSPoint::new(100.0, 176.0), NSSize::new(200.0, 26.0))
+        initWithFrame: NSRect::new(NSPoint::new(100.0, 204.0), NSSize::new(200.0, 26.0))
         pullsDown: NO
     ];
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Classic")];
@@ -687,19 +741,38 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _ = SKIN_LABEL.set(skin_label as usize);
     let _ = SKIN_POPUP.set(skin_popup as usize);
 
+    // Âm thanh click: nhiều kiểu, trong đó có tiếng pháo hoa
+    let sound_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Sound")];
+    let _: () = msg_send![sound_label, setFrame: NSRect::new(NSPoint::new(20.0, 172.0), NSSize::new(70.0, 18.0))];
+    let _: () = msg_send![content, addSubview: sound_label];
+
+    let sound_popup: id = msg_send![class!(NSPopUpButton), alloc];
+    let sound_popup: id = msg_send![
+        sound_popup,
+        initWithFrame: NSRect::new(NSPoint::new(100.0, 166.0), NSSize::new(200.0, 26.0))
+        pullsDown: NO
+    ];
+    for label in SOUND_LABELS {
+        let _: () = msg_send![sound_popup, addItemWithTitle: nsstring(label)];
+    }
+    let _: () = msg_send![sound_popup, selectItemAtIndex: sound_index()];
+    let _: () = msg_send![sound_popup, setTarget: controller];
+    let _: () = msg_send![sound_popup, setAction: sel!(changeSound:)];
+    let _: () = msg_send![content, addSubview: sound_popup];
+
     let checkbox: id = msg_send![
         class!(NSButton),
-        checkboxWithTitle: nsstring("Play firework sound on click")
+        checkboxWithTitle: nsstring("Play sound on click")
         target: controller
         action: sel!(toggleSound:)
     ];
     let state: i64 = if sound_enabled() { 1 } else { 0 };
     let _: () = msg_send![checkbox, setState: state];
-    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 146.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 136.0), NSSize::new(280.0, 22.0))];
     let _: () = msg_send![content, addSubview: checkbox];
 
     let volume_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Volume")];
-    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 118.0), NSSize::new(120.0, 18.0))];
+    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 108.0), NSSize::new(120.0, 18.0))];
     let _: () = msg_send![content, addSubview: volume_label];
 
     // Phần trăm âm lượng hiện tại, cập nhật ngay khi kéo slider
@@ -710,12 +783,12 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![percent, setAlignment: 2i64];
     let percent_color: id = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![percent, setTextColor: percent_color];
-    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 118.0), NSSize::new(60.0, 18.0))];
+    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 108.0), NSSize::new(60.0, 18.0))];
     let _: () = msg_send![content, addSubview: percent];
     let _ = VOLUME_LABEL.set(percent as usize);
 
     let slider: id = msg_send![class!(NSSlider), alloc];
-    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(20.0, 92.0), NSSize::new(280.0, 24.0))];
+    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(20.0, 82.0), NSSize::new(280.0, 24.0))];
     let _: () = msg_send![slider, setMinValue: 0.0f64];
     let _: () = msg_send![slider, setMaxValue: 1.0f64];
     let _: () = msg_send![slider, setDoubleValue: sound_volume() as f64];
@@ -724,8 +797,8 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![slider, setAction: sel!(changeVolume:)];
     let _: () = msg_send![content, addSubview: slider];
 
-    let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Click fires a firework; Neon trail follows your cursor.")];
-    let _: () = msg_send![hint, setFrame: NSRect::new(NSPoint::new(20.0, 66.0), NSSize::new(280.0, 18.0))];
+    let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Click = firework, Neon = trail follows cursor.")];
+    let _: () = msg_send![hint, setFrame: NSRect::new(NSPoint::new(20.0, 56.0), NSSize::new(280.0, 18.0))];
     let color: id = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![hint, setTextColor: color];
     let _: () = msg_send![content, addSubview: hint];
@@ -1911,6 +1984,7 @@ fn main() {
 
         // Tiếng click, hiệu ứng, panel settings và icon trên menu bar
         load_sound_preference();
+        load_sound_kind_preference();
         load_effect_preference();
         load_skin_preference();
         load_sounds();

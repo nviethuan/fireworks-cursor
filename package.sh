@@ -81,11 +81,16 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 PLIST
 plutil -lint "$CONTENTS/Info.plist" > /dev/null
 
-# Âm thanh khi click (CC0, ~0.13s)
-if [[ -f assets/click.wav ]]; then
-    cp assets/click.wav "$CONTENTS/Resources/click.wav"
+# Âm thanh khi click: click.wav có sẵn (CC0) + các bản tổng hợp bởi tools/make_sounds.py
+shopt -s nullglob
+WAVS=(assets/*.wav)
+shopt -u nullglob
+if [[ ${#WAVS[@]} -gt 0 ]]; then
+    for wav in "${WAVS[@]}"; do
+        cp "$wav" "$CONTENTS/Resources/$(basename "$wav")"
+    done
 else
-    echo "    (không có assets/click.wav — app sẽ chạy không tiếng)"
+    echo "    (không có file .wav trong assets — app sẽ chạy không tiếng)"
 fi
 
 if [[ -f "$ICON_SRC" ]]; then
