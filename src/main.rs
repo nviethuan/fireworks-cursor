@@ -180,7 +180,6 @@ unsafe fn set_sound_rows_hidden(hidden: bool) {
     for slot in [
         &SOUND_LABEL,
         &SOUND_POPUP,
-        &SOUND_CHECKBOX,
         &VOLUME_TITLE,
         &VOLUME_LABEL,
         &VOLUME_SLIDER,
@@ -521,7 +520,7 @@ fn load_sounds() {
 
 fn play_click_sound() {
     // Cụm cấu hình âm thanh gắn với pháo hoa click: tắt pháo hoa thì không có tiếng
-    if !sound_enabled() || !fireworks_on() {
+    if !sound_enabled() {
         return;
     }
     let Some(pools) = SOUND_POOLS.get() else {
@@ -566,6 +565,10 @@ extern "C" fn toggle_sound(_this: &Object, _sel: Sel, sender: id) {
         let state: i64 = msg_send![sender, state];
         let enabled = state != 0;
         SOUND_ENABLED.store(enabled, Ordering::Relaxed);
+
+        // Sound + volume chỉ hiện khi "Play sound on click" đang bật
+        set_sound_rows_hidden(!enabled);
+
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
         let key = nsstring("SoundEnabled");
         let _: () = msg_send![defaults, setBool: enabled forKey: key];
@@ -607,9 +610,6 @@ extern "C" fn toggle_fireworks(_this: &Object, _sel: Sel, sender: id) {
                 update_dirty_bounds(&mut scene);
             }
         }
-
-        // Âm thanh click chỉ có ý nghĩa với pháo hoa -> ẩn/hiện cụm cấu hình theo
-        set_sound_rows_hidden(!enabled);
 
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
         let key = nsstring("FireworksEnabled");
@@ -752,18 +752,7 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 300.0), NSSize::new(280.0, 20.0))];
     let _: () = msg_send![content, addSubview: title];
 
-    // Hai hiệu ứng bật/tắt độc lập: có thể bật cả hai cùng lúc
-    let fireworks_box: id = msg_send![
-        class!(NSButton),
-        checkboxWithTitle: nsstring("Fireworks on click")
-        target: controller
-        action: sel!(toggleFireworks:)
-    ];
-    let state: i64 = if fireworks_on() { 1 } else { 0 };
-    let _: () = msg_send![fireworks_box, setState: state];
-    let _: () = msg_send![fireworks_box, setFrame: NSRect::new(NSPoint::new(20.0, 268.0), NSSize::new(280.0, 22.0))];
-    let _: () = msg_send![content, addSubview: fireworks_box];
-
+    // ================= Neon trail =================
     let neon_box: id = msg_send![
         class!(NSButton),
         checkboxWithTitle: nsstring("Neon trail follows cursor")
@@ -772,18 +761,18 @@ unsafe fn build_settings_window(controller: id) -> id {
     ];
     let state: i64 = if neon_on() { 1 } else { 0 };
     let _: () = msg_send![neon_box, setState: state];
-    let _: () = msg_send![neon_box, setFrame: NSRect::new(NSPoint::new(20.0, 242.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![neon_box, setFrame: NSRect::new(NSPoint::new(20.0, 268.0), NSSize::new(280.0, 22.0))];
     let _: () = msg_send![content, addSubview: neon_box];
 
-    // Skin của dải neon: Classic (dải neon mượt) hay Pixel love (tim pixel)
+    // Skin phụ thuộc neon: ngay dưới, thụt vào
     let skin_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Skin")];
-    let _: () = msg_send![skin_label, setFrame: NSRect::new(NSPoint::new(20.0, 210.0), NSSize::new(70.0, 18.0))];
+    let _: () = msg_send![skin_label, setFrame: NSRect::new(NSPoint::new(36.0, 240.0), NSSize::new(60.0, 18.0))];
     let _: () = msg_send![content, addSubview: skin_label];
 
     let skin_popup: id = msg_send![class!(NSPopUpButton), alloc];
     let skin_popup: id = msg_send![
         skin_popup,
-        initWithFrame: NSRect::new(NSPoint::new(100.0, 204.0), NSSize::new(200.0, 26.0))
+        initWithFrame: NSRect::new(NSPoint::new(100.0, 234.0), NSSize::new(200.0, 26.0))
         pullsDown: NO
     ];
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Classic")];
@@ -803,15 +792,40 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _ = SKIN_LABEL.set(skin_label as usize);
     let _ = SKIN_POPUP.set(skin_popup as usize);
 
-    // Âm thanh click: nhiều kiểu, trong đó có tiếng pháo hoa
+    // ================= Fireworks (độc lập) =================
+    let fireworks_box: id = msg_send![
+        class!(NSButton),
+        checkboxWithTitle: nsstring("Fireworks on click")
+        target: controller
+        action: sel!(toggleFireworks:)
+    ];
+    let state: i64 = if fireworks_on() { 1 } else { 0 };
+    let _: () = msg_send![fireworks_box, setState: state];
+    let _: () = msg_send![fireworks_box, setFrame: NSRect::new(NSPoint::new(20.0, 202.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![content, addSubview: fireworks_box];
+
+    // ================= Sound (ngang hàng với Fireworks) =================
+    let checkbox: id = msg_send![
+        class!(NSButton),
+        checkboxWithTitle: nsstring("Play sound on click")
+        target: controller
+        action: sel!(toggleSound:)
+    ];
+    let state: i64 = if sound_enabled() { 1 } else { 0 };
+    let _: () = msg_send![checkbox, setState: state];
+    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 176.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![content, addSubview: checkbox];
+    let _ = SOUND_CHECKBOX.set(checkbox as usize);
+
+    // Sound + Volume phụ thuộc "Play sound on click": thụt vào
     let sound_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Sound")];
-    let _: () = msg_send![sound_label, setFrame: NSRect::new(NSPoint::new(20.0, 172.0), NSSize::new(70.0, 18.0))];
+    let _: () = msg_send![sound_label, setFrame: NSRect::new(NSPoint::new(36.0, 148.0), NSSize::new(60.0, 18.0))];
     let _: () = msg_send![content, addSubview: sound_label];
 
     let sound_popup: id = msg_send![class!(NSPopUpButton), alloc];
     let sound_popup: id = msg_send![
         sound_popup,
-        initWithFrame: NSRect::new(NSPoint::new(100.0, 166.0), NSSize::new(200.0, 26.0))
+        initWithFrame: NSRect::new(NSPoint::new(100.0, 142.0), NSSize::new(200.0, 26.0))
         pullsDown: NO
     ];
     for label in SOUND_LABELS {
@@ -824,24 +838,11 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _ = SOUND_LABEL.set(sound_label as usize);
     let _ = SOUND_POPUP.set(sound_popup as usize);
 
-    let checkbox: id = msg_send![
-        class!(NSButton),
-        checkboxWithTitle: nsstring("Play sound on click")
-        target: controller
-        action: sel!(toggleSound:)
-    ];
-    let state: i64 = if sound_enabled() { 1 } else { 0 };
-    let _: () = msg_send![checkbox, setState: state];
-    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 136.0), NSSize::new(280.0, 22.0))];
-    let _: () = msg_send![content, addSubview: checkbox];
-    let _ = SOUND_CHECKBOX.set(checkbox as usize);
-
     let volume_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Volume")];
-    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 108.0), NSSize::new(120.0, 18.0))];
+    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(36.0, 114.0), NSSize::new(120.0, 18.0))];
     let _: () = msg_send![content, addSubview: volume_label];
     let _ = VOLUME_TITLE.set(volume_label as usize);
 
-    // Phần trăm âm lượng hiện tại, cập nhật ngay khi kéo slider
     let percent_text = format!("{}%", (sound_volume() * 100.0).round() as i32);
     let percent: id = msg_send![class!(NSTextField), labelWithString: nsstring(&percent_text)];
     let percent_font: id = msg_send![class!(NSFont), monospacedDigitSystemFontOfSize: 12.0f64 weight: 0.0f64];
@@ -849,12 +850,12 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![percent, setAlignment: 2i64];
     let percent_color: id = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![percent, setTextColor: percent_color];
-    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 108.0), NSSize::new(60.0, 18.0))];
+    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 114.0), NSSize::new(60.0, 18.0))];
     let _: () = msg_send![content, addSubview: percent];
     let _ = VOLUME_LABEL.set(percent as usize);
 
     let slider: id = msg_send![class!(NSSlider), alloc];
-    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(20.0, 82.0), NSSize::new(280.0, 24.0))];
+    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(36.0, 88.0), NSSize::new(264.0, 24.0))];
     let _: () = msg_send![slider, setMinValue: 0.0f64];
     let _: () = msg_send![slider, setMaxValue: 1.0f64];
     let _: () = msg_send![slider, setDoubleValue: sound_volume() as f64];
@@ -864,9 +865,10 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![content, addSubview: slider];
     let _ = VOLUME_SLIDER.set(slider as usize);
 
-    // Chọn âm thanh + âm lượng chỉ hiện khi pháo hoa click đang bật
-    set_sound_rows_hidden(!fireworks_on());
+    // Sound + volume chỉ hiện khi "Play sound on click" đang bật
+    set_sound_rows_hidden(!sound_enabled());
 
+    // ================= Chân cửa sổ =================
     let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Both effects can be enabled at the same time.")];
     let _: () = msg_send![hint, setFrame: NSRect::new(NSPoint::new(20.0, 56.0), NSSize::new(280.0, 18.0))];
     let color: id = msg_send![class!(NSColor), secondaryLabelColor];
