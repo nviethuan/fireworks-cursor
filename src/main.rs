@@ -38,6 +38,8 @@ extern "C" {
     fn CGRequestListenEventAccess() -> bool;
     fn CGCursorIsVisible() -> bool;
     fn CGContextClearRect(context: CGContextRef, rect: CGRect);
+    /// Bật lại event tap sau khi macOS tự ngắt nó (callback chậm quá thời gian cho phép).
+    fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
 }
 
 fn os_major_version() -> u32 {
@@ -143,6 +145,8 @@ const IDLE_HIDE_SECS: f64 = 5.0;
 /// Mẫu vị trí chuột (toạ độ Cocoa) do CGEventTap ghi lại, kèm thời điểm nhận.
 /// Tap bắt được mọi event chuột nên mẫu dày hơn nhiều so với 1 mẫu/frame.
 static MOUSE_SAMPLES: Mutex<Vec<MouseSample>> = Mutex::new(Vec::new());
+/// Mach port của event tap, để bật lại khi macOS tự ngắt (0 = chưa có)
+static EVENT_TAP_PORT: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_MOUSE_SAMPLES: usize = 512;
 
@@ -151,6 +155,8 @@ const MAX_MOUSE_SAMPLES: usize = 512;
 static SETTINGS_WINDOW: OnceLock<usize> = OnceLock::new();
 static STATUS_ITEM: OnceLock<usize> = OnceLock::new();
 static VOLUME_LABEL: OnceLock<usize> = OnceLock::new();
+static SKIN_LABEL: OnceLock<usize> = OnceLock::new();
+static SKIN_POPUP: OnceLock<usize> = OnceLock::new();
 
 fn nsstring(s: &str) -> id {
     unsafe { NSString::alloc(nil).init_str(s) }
@@ -530,6 +536,15 @@ extern "C" fn change_effect(_this: &Object, _sel: Sel, sender: id) {
         };
         EFFECT.store(effect, Ordering::Relaxed);
 
+        // Skin chỉ có ý nghĩa với Neon trail -> chỉ hiện ô chọn skin khi chọn Neon
+        let hidden = if effect == EFFECT_NEON { NO } else { YES };
+        if let Some(label) = SKIN_LABEL.get() {
+            let _: () = msg_send![*label as id, setHidden: hidden];
+        }
+        if let Some(popup) = SKIN_POPUP.get() {
+            let _: () = msg_send![*popup as id, setHidden: hidden];
+        }
+
         // Đổi hiệu ứng thì dọn cảnh cũ cho sạch
         if let Ok(mut scene) = get_scene().lock() {
             scene.particles.clear();
@@ -663,6 +678,14 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![skin_popup, setTarget: controller];
     let _: () = msg_send![skin_popup, setAction: sel!(changeSkin:)];
     let _: () = msg_send![content, addSubview: skin_popup];
+
+    // Skin chỉ hiện khi effect đang là Neon trail
+    let neon = EFFECT.load(Ordering::Relaxed) == EFFECT_NEON;
+    let hidden = if neon { NO } else { YES };
+    let _: () = msg_send![skin_label, setHidden: hidden];
+    let _: () = msg_send![skin_popup, setHidden: hidden];
+    let _ = SKIN_LABEL.set(skin_label as usize);
+    let _ = SKIN_POPUP.set(skin_popup as usize);
 
     let checkbox: id = msg_send![
         class!(NSButton),
@@ -808,6 +831,9 @@ struct Scene {
     was_moving: bool,
     /// Yêu cầu vẽ lại toàn bộ overlay một lần (dọn sạch mọi pixel sót lại)
     full_refresh: bool,
+    /// Vị trí con trỏ ở frame trước: dùng làm tín hiệu "chuột đang di chuyển" khi
+    /// event tap không ghi được mẫu nào.
+    last_cursor: Option<(f64, f64)>,
 }
 
 static SCENE: OnceLock<Mutex<Scene>> = OnceLock::new();
@@ -825,6 +851,7 @@ fn get_scene() -> &'static Mutex<Scene> {
             paint_history: Vec::new(),
             dirty_bounds: None,
             was_moving: false,
+            last_cursor: None,
             full_refresh: false,
         })
     })
@@ -1555,6 +1582,15 @@ fn tick() {
     let cursor: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
     let cursor = (cursor.x, cursor.y);
 
+    // Con trỏ đổi vị trí tức là vẫn có tương tác, kể cả khi event tap bị hệ thống
+    // ngắt nên không có mẫu nào: nếu chỉ dựa vào mẫu, hiệu ứng đã ẩn sẽ nằm im
+    // mãi mãi dù chuột vẫn di chuyển.
+    let cursor_moved = match scene.last_cursor {
+        Some((x, y)) => (x - cursor.0).abs() > 0.5 || (y - cursor.1).abs() > 0.5,
+        None => true,
+    };
+    scene.last_cursor = Some(cursor);
+
     // Mẫu vị trí thật do CGEventTap ghi lại (mỗi event chuột là một mẫu), nên dải
     // sáng bám đúng đường đi kể cả khi chuột flick rất nhanh.
     let mut samples = take_mouse_samples();
@@ -1567,13 +1603,13 @@ fn tick() {
     }
 
     // Vừa dừng chuột -> vẽ lại toàn bộ một lần cho chắc, dọn mọi pixel còn sót
-    let moving = !samples.is_empty();
+    let moving = !samples.is_empty() || cursor_moved;
     if scene.was_moving && !moving {
         scene.full_refresh = true;
     }
     scene.was_moving = moving;
 
-    if samples.is_empty() {
+    if samples.is_empty() && !cursor_moved {
         scene.idle_secs += dt;
     } else {
         scene.idle_secs = 0.0;
@@ -1914,6 +1950,15 @@ fn main() {
                                 );
                             }
                         }
+                        CGEventType::TapDisabledByTimeout
+                        | CGEventType::TapDisabledByUserInput => {
+                            // macOS tự ngắt tap khi callback của mình chạy quá lâu.
+                            // Không bật lại thì app mất hẵn mẫu chuột.
+                            let port = EVENT_TAP_PORT.load(Ordering::Relaxed);
+                            if port != 0 {
+                                CGEventTapEnable(port as *mut std::ffi::c_void, true);
+                            }
+                        }
                         _ => {
                             let loc = event.location();
                             let cocoa_y = screen_height - loc.y;
@@ -1939,6 +1984,10 @@ fn main() {
                         run_loop,
                         loop_source.as_concrete_TypeRef(),
                         kCFRunLoopCommonModes,
+                    );
+                    EVENT_TAP_PORT.store(
+                        tap.mach_port.as_concrete_TypeRef() as usize,
+                        Ordering::Relaxed,
                     );
                     tap.enable();
                     CFRunLoopRun();
