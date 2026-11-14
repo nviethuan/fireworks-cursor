@@ -133,6 +133,12 @@ const SKIN_NORTHERN_LIGHTS: u8 = 4;
 static SKIN: AtomicU8 = AtomicU8::new(SKIN_CLASSIC);
 /// Con trỏ có đang được hiển thị không (video fullscreen sẽ ẩn con trỏ)
 static CURSOR_VISIBLE: AtomicBool = AtomicBool::new(true);
+/// Hiệu ứng đang bị ẩn (con trỏ ẩn, hoặc chuột im quá lâu nên macOS đã tự ẩn con trỏ)
+static EFFECT_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Chuột đứng yên quá lâu thì coi như con trỏ đã bị hệ thống ẩn (macOS ẩn con trỏ
+/// sau vài giây khi xem video fullscreen). Hiệu ứng phải ẩn theo con trỏ.
+const IDLE_HIDE_SECS: f64 = 5.0;
 
 /// Mẫu vị trí chuột (toạ độ Cocoa) do CGEventTap ghi lại, kèm thời điểm nhận.
 /// Tap bắt được mọi event chuột nên mẫu dày hơn nhiều so với 1 mẫu/frame.
@@ -1025,7 +1031,7 @@ fn update_dirty_bounds(scene: &mut Scene) {
     for particle in scene.particles.iter() {
         include(particle.x, particle.y, particle.size * 4.4 + 6.0);
     }
-    if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON && CURSOR_VISIBLE.load(Ordering::Relaxed) {
+    if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON && !EFFECT_HIDDEN.load(Ordering::Relaxed) {
         // Dải sáng: nửa bề rộng quầng lớn nhất (48/2) + làm mượt + khử răng cưa,
         // và quầng đầu dải (bán kính 30)
         for point in scene.trail.iter() {
@@ -1532,15 +1538,16 @@ fn tick() {
     // ~40% CPU. Kiểm tra ~6 lần/giây là đủ để ẩn/hiện theo con trỏ.
     static VIS_FRAME: AtomicUsize = AtomicUsize::new(0);
     let vis_frame = VIS_FRAME.fetch_add(1, Ordering::Relaxed);
-    if vis_frame % 10 == 0 {
+    if vis_frame % 4 == 0 {
         let visible = unsafe { CGCursorIsVisible() };
         CURSOR_VISIBLE.store(visible, Ordering::Relaxed);
     }
 
     if !CURSOR_VISIBLE.load(Ordering::Relaxed) {
+        EFFECT_HIDDEN.store(true, Ordering::Relaxed);
         scene.trail.clear();
+        scene.particles.clear();
         scene.head_init = false;
-        scene.idle_secs = 0.0;
         update_dirty_bounds(&mut scene);
         return;
     }
@@ -1571,6 +1578,19 @@ fn tick() {
     } else {
         scene.idle_secs = 0.0;
     }
+
+    // Chuột im quá lâu -> macOS ẩn con trỏ (thường gặp khi xem video fullscreen),
+    // nên hiệu ứng cũng phải biến mất. `idle_secs` không bị reset ở đây để hiệu ứng
+    // ở trạng thái ẩn cho tới khi chuột di chuyển lại.
+    if scene.idle_secs > IDLE_HIDE_SECS {
+        EFFECT_HIDDEN.store(true, Ordering::Relaxed);
+        scene.trail.clear();
+        scene.particles.clear();
+        scene.head_init = false;
+        update_dirty_bounds(&mut scene);
+        return;
+    }
+    EFFECT_HIDDEN.store(false, Ordering::Relaxed);
 
     scene.hue_phase = (scene.hue_phase + dt * 0.55) % 1.0;
 
@@ -1742,7 +1762,7 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
 
         // Dải sáng neon bám theo con trỏ
         if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON
-            && CURSOR_VISIBLE.load(Ordering::Relaxed)
+            && !EFFECT_HIDDEN.load(Ordering::Relaxed)
             && scene.trail.len() > 2
         {
             let count = scene.trail.len();
