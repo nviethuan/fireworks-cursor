@@ -5,7 +5,7 @@ use cocoa::appkit::{
     NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use cocoa::base::{id, nil, NO, YES};
-use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize};
+use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun};
 use core_graphics::event::{
@@ -16,6 +16,7 @@ use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use rand::Rng;
 use std::f64::consts::TAU;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
@@ -97,6 +98,272 @@ fn accessibility_granted() -> bool {
 
     print_permission_hint(accessibility, listen_event);
     false
+}
+
+// ---------- Âm thanh khi click ----------
+
+static SOUND_ENABLED: AtomicBool = AtomicBool::new(true);
+static SOUND_PENDING: AtomicBool = AtomicBool::new(false);
+static SOUND_POOL: OnceLock<Vec<usize>> = OnceLock::new();
+static SOUND_NEXT: AtomicUsize = AtomicUsize::new(0);
+static SOUND_VOLUME_BITS: AtomicU32 = AtomicU32::new(0.45f32.to_bits());
+
+// ---------- Menu bar + panel settings ----------
+
+static SETTINGS_WINDOW: OnceLock<usize> = OnceLock::new();
+static STATUS_ITEM: OnceLock<usize> = OnceLock::new();
+static VOLUME_LABEL: OnceLock<usize> = OnceLock::new();
+
+fn nsstring(s: &str) -> id {
+    unsafe { NSString::alloc(nil).init_str(s) }
+}
+
+fn sound_enabled() -> bool {
+    SOUND_ENABLED.load(Ordering::Relaxed)
+}
+
+fn sound_volume() -> f32 {
+    f32::from_bits(SOUND_VOLUME_BITS.load(Ordering::Relaxed))
+}
+
+fn set_sound_volume(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    SOUND_VOLUME_BITS.store(value.to_bits(), Ordering::Relaxed);
+    value
+}
+
+fn load_sound_preference() {
+    unsafe {
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("SoundEnabled");
+        let stored: id = msg_send![defaults, objectForKey: key];
+        if stored != nil {
+            let enabled: bool = msg_send![defaults, boolForKey: key];
+            SOUND_ENABLED.store(enabled, Ordering::Relaxed);
+        }
+
+        let volume_key = nsstring("SoundVolume");
+        let stored_volume: id = msg_send![defaults, objectForKey: volume_key];
+        if stored_volume != nil {
+            let volume: f32 = msg_send![defaults, floatForKey: volume_key];
+            set_sound_volume(volume);
+        }
+    }
+}
+
+/// Nạp sẵn vài bản sao để click liên tiếp vẫn phát, không cắt tiếng của nhau.
+fn load_sounds() {
+    let mut pool: Vec<usize> = Vec::with_capacity(4);
+    unsafe {
+        let bundle: id = msg_send![class!(NSBundle), mainBundle];
+        let path: id = msg_send![
+            bundle,
+            pathForResource: nsstring("click")
+            ofType: nsstring("wav")
+        ];
+        if path == nil {
+            eprintln!("Không thấy click.wav trong bundle: app sẽ chạy không tiếng.");
+        } else {
+            for _ in 0..4 {
+                let sound: id = msg_send![class!(NSSound), alloc];
+                let sound: id = msg_send![sound, initWithContentsOfFile: path byReference: YES];
+                if sound != nil {
+                    let _: () = msg_send![sound, setVolume: sound_volume()];
+                    pool.push(sound as usize);
+                }
+            }
+        }
+    }
+    SOUND_POOL.get_or_init(|| pool);
+}
+
+fn play_click_sound() {
+    if !sound_enabled() {
+        return;
+    }
+    let Some(pool) = SOUND_POOL.get() else {
+        return;
+    };
+    if pool.is_empty() {
+        return;
+    }
+    let index = SOUND_NEXT.fetch_add(1, Ordering::Relaxed) % pool.len();
+    unsafe {
+        let sound = pool[index] as id;
+        let _: () = msg_send![sound, stop];
+        let _: bool = msg_send![sound, play];
+    }
+}
+
+// ---------- Hành động của panel settings ----------
+
+extern "C" fn open_settings(_this: &Object, _sel: Sel, _sender: id) {
+    unsafe {
+        let _: () = msg_send![NSApp(), activateIgnoringOtherApps: YES];
+        if let Some(window) = SETTINGS_WINDOW.get() {
+            let window = *window as id;
+            let _: () = msg_send![window, makeKeyAndOrderFront: nil];
+        }
+    }
+}
+
+extern "C" fn toggle_sound(_this: &Object, _sel: Sel, sender: id) {
+    unsafe {
+        let state: i64 = msg_send![sender, state];
+        let enabled = state != 0;
+        SOUND_ENABLED.store(enabled, Ordering::Relaxed);
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("SoundEnabled");
+        let _: () = msg_send![defaults, setBool: enabled forKey: key];
+    }
+}
+
+extern "C" fn change_volume(_this: &Object, _sel: Sel, sender: id) {
+    unsafe {
+        let value: f64 = msg_send![sender, doubleValue];
+        let volume = set_sound_volume(value as f32);
+        if let Some(pool) = SOUND_POOL.get() {
+            for sound in pool {
+                let _: () = msg_send![*sound as id, setVolume: volume];
+            }
+        }
+        if let Some(label) = VOLUME_LABEL.get() {
+            let text = format!("{}%", (volume * 100.0).round() as i32);
+            let _: () = msg_send![*label as id, setStringValue: nsstring(&text)];
+        }
+
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("SoundVolume");
+        let _: () = msg_send![defaults, setFloat: volume forKey: key];
+    }
+}
+
+extern "C" fn quit_app(_this: &Object, _sel: Sel, _sender: id) {
+    unsafe {
+        let _: () = msg_send![NSApp(), terminate: nil];
+    }
+}
+
+fn register_controller_class() -> *const Class {
+    let mut decl = ClassDecl::new("FireworksController", class!(NSObject)).unwrap();
+    unsafe {
+        decl.add_method(
+            sel!(openSettings:),
+            open_settings as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(toggleSound:),
+            toggle_sound as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(changeVolume:),
+            change_volume as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(quitApp:),
+            quit_app as extern "C" fn(&Object, Sel, id),
+        );
+    }
+    decl.register()
+}
+
+unsafe fn build_settings_window(controller: id) -> id {
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 212.0));
+    let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
+        frame,
+        NSWindowStyleMask::NSTitledWindowMask | NSWindowStyleMask::NSClosableWindowMask,
+        NSBackingStoreBuffered,
+        NO,
+    );
+    let _: () = msg_send![window, setTitle: nsstring("Mac Fireworks")];
+    let _: () = msg_send![window, setReleasedWhenClosed: NO];
+    let _: () = msg_send![window, center];
+
+    let content: id = msg_send![window, contentView];
+
+    let title: id = msg_send![class!(NSTextField), labelWithString: nsstring("Fireworks on click")];
+    let font: id = msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64];
+    let _: () = msg_send![title, setFont: font];
+    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 166.0), NSSize::new(280.0, 20.0))];
+    let _: () = msg_send![content, addSubview: title];
+
+    let checkbox: id = msg_send![
+        class!(NSButton),
+        checkboxWithTitle: nsstring("Play firework sound on click")
+        target: controller
+        action: sel!(toggleSound:)
+    ];
+    let state: i64 = if sound_enabled() { 1 } else { 0 };
+    let _: () = msg_send![checkbox, setState: state];
+    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 136.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![content, addSubview: checkbox];
+
+    let volume_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Volume")];
+    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 110.0), NSSize::new(120.0, 18.0))];
+    let _: () = msg_send![content, addSubview: volume_label];
+
+    // Phần trăm âm lượng hiện tại, cập nhật ngay khi kéo slider
+    let percent_text = format!("{}%", (sound_volume() * 100.0).round() as i32);
+    let percent: id = msg_send![class!(NSTextField), labelWithString: nsstring(&percent_text)];
+    let percent_font: id = msg_send![class!(NSFont), monospacedDigitSystemFontOfSize: 12.0f64 weight: 0.0f64];
+    let _: () = msg_send![percent, setFont: percent_font];
+    let _: () = msg_send![percent, setAlignment: 2i64];
+    let percent_color: id = msg_send![class!(NSColor), secondaryLabelColor];
+    let _: () = msg_send![percent, setTextColor: percent_color];
+    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 110.0), NSSize::new(60.0, 18.0))];
+    let _: () = msg_send![content, addSubview: percent];
+    let _ = VOLUME_LABEL.set(percent as usize);
+
+    let slider: id = msg_send![class!(NSSlider), alloc];
+    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(20.0, 84.0), NSSize::new(280.0, 24.0))];
+    let _: () = msg_send![slider, setMinValue: 0.0f64];
+    let _: () = msg_send![slider, setMaxValue: 1.0f64];
+    let _: () = msg_send![slider, setDoubleValue: sound_volume() as f64];
+    let _: () = msg_send![slider, setContinuous: YES];
+    let _: () = msg_send![slider, setTarget: controller];
+    let _: () = msg_send![slider, setAction: sel!(changeVolume:)];
+    let _: () = msg_send![content, addSubview: slider];
+
+    let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Each click fires a neon firework across the screen.")];
+    let _: () = msg_send![hint, setFrame: NSRect::new(NSPoint::new(20.0, 58.0), NSSize::new(280.0, 18.0))];
+    let color: id = msg_send![class!(NSColor), secondaryLabelColor];
+    let _: () = msg_send![hint, setTextColor: color];
+    let _: () = msg_send![content, addSubview: hint];
+
+    let quit: id = msg_send![
+        class!(NSButton),
+        buttonWithTitle: nsstring("Quit Mac Fireworks")
+        target: controller
+        action: sel!(quitApp:)
+    ];
+    let _: () = msg_send![quit, setFrame: NSRect::new(NSPoint::new(20.0, 14.0), NSSize::new(170.0, 30.0))];
+    let _: () = msg_send![content, addSubview: quit];
+
+    window as id
+}
+
+unsafe fn build_status_item(controller: id) {
+    let bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
+    let item: id = msg_send![bar, statusItemWithLength: -1.0f64];
+    let button: id = msg_send![item, button];
+
+    // SF Symbol "sparkles" — biểu tượng pháo hoa sẵn có của hệ thống
+    let image: id = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: nsstring("sparkles")
+        accessibilityDescription: nsstring("Mac Fireworks")
+    ];
+    if image != nil {
+        let _: () = msg_send![image, setTemplate: YES];
+        let _: () = msg_send![button, setImage: image];
+    } else {
+        let _: () = msg_send![button, setTitle: nsstring("✦")];
+    }
+
+    let _: () = msg_send![button, setTarget: controller];
+    let _: () = msg_send![button, setAction: sel!(openSettings:)];
+    let _: () = msg_send![item, retain];
+    let _ = STATUS_ITEM.set(item as usize);
 }
 
 struct Particle {
@@ -307,6 +574,13 @@ fn main() {
         // chưa cấp quyền Trợ năng.
         spawn_firework(screen_frame.size.width / 2.0, screen_height / 2.0);
 
+        // Tiếng click, panel settings và icon trên menu bar
+        load_sound_preference();
+        load_sounds();
+        let controller: id = msg_send![register_controller_class(), new];
+        let _ = SETTINGS_WINDOW.set(build_settings_window(controller) as usize);
+        build_status_item(controller);
+
         if trusted {
         thread::spawn(move || {
             let tap = CGEventTap::new(
@@ -318,6 +592,8 @@ fn main() {
                     let loc = event.location();
                     let cocoa_y = screen_height - loc.y;
                     spawn_firework(loc.x, cocoa_y);
+                    // Phát tiếng ở main thread (trong timer) để không đụng AppKit từ thread này
+                    SOUND_PENDING.store(true, Ordering::Relaxed);
                     None
                 },
             );
@@ -349,6 +625,9 @@ fn main() {
 
         let view_ptr = view as usize;
         let timer_block = block::ConcreteBlock::new(move |_timer: id| {
+            if SOUND_PENDING.swap(false, Ordering::Relaxed) {
+                play_click_sound();
+            }
             let v = view_ptr as id;
             let _: () = msg_send![v, setNeedsDisplay: YES];
         })

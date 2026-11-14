@@ -81,6 +81,13 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 PLIST
 plutil -lint "$CONTENTS/Info.plist" > /dev/null
 
+# Âm thanh khi click (CC0, ~0.13s)
+if [[ -f assets/click.wav ]]; then
+    cp assets/click.wav "$CONTENTS/Resources/click.wav"
+else
+    echo "    (không có assets/click.wav — app sẽ chạy không tiếng)"
+fi
+
 if [[ -f "$ICON_SRC" ]]; then
     echo "==> Tạo icon từ $ICON_SRC"
     ICONSET="$(mktemp -d)/AppIcon.iconset"
