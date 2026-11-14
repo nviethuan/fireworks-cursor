@@ -126,10 +126,9 @@ static SOUND_VOLUME_BITS: AtomicU32 = AtomicU32::new(0.45f32.to_bits());
 
 // ---------- Hiệu ứng ----------
 
-const EFFECT_FIREWORKS: u8 = 0;
-const EFFECT_NEON: u8 = 1;
-
-static EFFECT: AtomicU8 = AtomicU8::new(EFFECT_FIREWORKS);
+/// Hai hiệu ứng bật/tắt độc lập nhau, có thể chạy cùng lúc.
+static FIREWORKS_ON: AtomicBool = AtomicBool::new(true);
+static NEON_ON: AtomicBool = AtomicBool::new(false);
 
 // ---------- Skin của dải neon ----------
 
@@ -162,11 +161,34 @@ const MAX_MOUSE_SAMPLES: usize = 512;
 static SETTINGS_WINDOW: OnceLock<usize> = OnceLock::new();
 static STATUS_ITEM: OnceLock<usize> = OnceLock::new();
 static VOLUME_LABEL: OnceLock<usize> = OnceLock::new();
+static VOLUME_TITLE: OnceLock<usize> = OnceLock::new();
+static VOLUME_SLIDER: OnceLock<usize> = OnceLock::new();
+static SOUND_LABEL: OnceLock<usize> = OnceLock::new();
+static SOUND_POPUP: OnceLock<usize> = OnceLock::new();
+static SOUND_CHECKBOX: OnceLock<usize> = OnceLock::new();
 static SKIN_LABEL: OnceLock<usize> = OnceLock::new();
 static SKIN_POPUP: OnceLock<usize> = OnceLock::new();
 
 fn nsstring(s: &str) -> id {
     unsafe { NSString::alloc(nil).init_str(s) }
+}
+
+/// Ẩn/hiện cả cụm cấu hình âm thanh (chọn âm thanh, "play sound", âm lượng).
+/// Cụm này chỉ có ý nghĩa khi pháo hoa click đang bật.
+unsafe fn set_sound_rows_hidden(hidden: bool) {
+    let flag = if hidden { YES } else { NO };
+    for slot in [
+        &SOUND_LABEL,
+        &SOUND_POPUP,
+        &SOUND_CHECKBOX,
+        &VOLUME_TITLE,
+        &VOLUME_LABEL,
+        &VOLUME_SLIDER,
+    ] {
+        if let Some(view) = slot.get() {
+            let _: () = msg_send![*view as id, setHidden: flag];
+        }
+    }
 }
 
 fn sound_enabled() -> bool {
@@ -183,21 +205,39 @@ fn set_sound_volume(value: f32) -> f32 {
     value
 }
 
-fn load_effect_preference() {
+fn load_effect_preferences() {
     unsafe {
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
-        let key = nsstring("Effect");
-        let stored: id = msg_send![defaults, objectForKey: key];
-        if stored != nil {
-            let value: i64 = msg_send![defaults, integerForKey: key];
-            let effect = if value == EFFECT_NEON as i64 {
-                EFFECT_NEON
-            } else {
-                EFFECT_FIREWORKS
-            };
-            EFFECT.store(effect, Ordering::Relaxed);
+        let fireworks_key = nsstring("FireworksEnabled");
+        let neon_key = nsstring("NeonEnabled");
+        let fireworks: id = msg_send![defaults, objectForKey: fireworks_key];
+        let neon: id = msg_send![defaults, objectForKey: neon_key];
+
+        if fireworks != nil || neon != nil {
+            let fireworks_on: bool = msg_send![defaults, boolForKey: fireworks_key];
+            let neon_on: bool = msg_send![defaults, boolForKey: neon_key];
+            FIREWORKS_ON.store(fireworks_on, Ordering::Relaxed);
+            NEON_ON.store(neon_on, Ordering::Relaxed);
+            return;
+        }
+
+        // Bản cũ lưu một key "Effect" duy nhất (0 = fireworks, 1 = neon)
+        let legacy_key = nsstring("Effect");
+        let legacy: id = msg_send![defaults, objectForKey: legacy_key];
+        if legacy != nil {
+            let value: i64 = msg_send![defaults, integerForKey: legacy_key];
+            FIREWORKS_ON.store(value == 0, Ordering::Relaxed);
+            NEON_ON.store(value == 1, Ordering::Relaxed);
         }
     }
+}
+
+fn fireworks_on() -> bool {
+    FIREWORKS_ON.load(Ordering::Relaxed)
+}
+
+fn neon_on() -> bool {
+    NEON_ON.load(Ordering::Relaxed)
 }
 
 fn load_skin_preference() {
@@ -244,14 +284,6 @@ fn skin_index() -> i64 {
         SKIN_BAT => 3,
         SKIN_NORTHERN_LIGHTS => 4,
         _ => 0,
-    }
-}
-
-fn effect_index() -> i64 {
-    if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON {
-        1
-    } else {
-        0
     }
 }
 
@@ -488,7 +520,8 @@ fn load_sounds() {
 }
 
 fn play_click_sound() {
-    if !sound_enabled() {
+    // Cụm cấu hình âm thanh gắn với pháo hoa click: tắt pháo hoa thì không có tiếng
+    if !sound_enabled() || !fireworks_on() {
         return;
     }
     let Some(pools) = SOUND_POOLS.get() else {
@@ -561,18 +594,37 @@ extern "C" fn change_volume(_this: &Object, _sel: Sel, sender: id) {
     }
 }
 
-extern "C" fn change_effect(_this: &Object, _sel: Sel, sender: id) {
+extern "C" fn toggle_fireworks(_this: &Object, _sel: Sel, sender: id) {
     unsafe {
-        let index: i64 = msg_send![sender, indexOfSelectedItem];
-        let effect = if index == 1 {
-            EFFECT_NEON
-        } else {
-            EFFECT_FIREWORKS
-        };
-        EFFECT.store(effect, Ordering::Relaxed);
+        let state: i64 = msg_send![sender, state];
+        let enabled = state != 0;
+        FIREWORKS_ON.store(enabled, Ordering::Relaxed);
 
-        // Skin chỉ có ý nghĩa với Neon trail -> chỉ hiện ô chọn skin khi chọn Neon
-        let hidden = if effect == EFFECT_NEON { NO } else { YES };
+        // Tắt pháo hoa thì dọn những quả đang bay cho khỏi "dính" lại trên màn hình
+        if !enabled {
+            if let Ok(mut scene) = get_scene().lock() {
+                scene.particles.clear();
+                update_dirty_bounds(&mut scene);
+            }
+        }
+
+        // Âm thanh click chỉ có ý nghĩa với pháo hoa -> ẩn/hiện cụm cấu hình theo
+        set_sound_rows_hidden(!enabled);
+
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("FireworksEnabled");
+        let _: () = msg_send![defaults, setBool: enabled forKey: key];
+    }
+}
+
+extern "C" fn toggle_neon(_this: &Object, _sel: Sel, sender: id) {
+    unsafe {
+        let state: i64 = msg_send![sender, state];
+        let enabled = state != 0;
+        NEON_ON.store(enabled, Ordering::Relaxed);
+
+        // Skin chỉ có ý nghĩa với neon trail -> chỉ hiện ô chọn skin khi neon bật
+        let hidden = if enabled { NO } else { YES };
         if let Some(label) = SKIN_LABEL.get() {
             let _: () = msg_send![*label as id, setHidden: hidden];
         }
@@ -580,17 +632,19 @@ extern "C" fn change_effect(_this: &Object, _sel: Sel, sender: id) {
             let _: () = msg_send![*popup as id, setHidden: hidden];
         }
 
-        // Đổi hiệu ứng thì dọn cảnh cũ cho sạch
+        // Tắt neon thì xoá dải sáng (và đốm lấp lánh của neon) ngay
         if let Ok(mut scene) = get_scene().lock() {
-            scene.particles.clear();
             scene.trail.clear();
             scene.head_init = false;
             scene.idle_secs = 0.0;
+            if !enabled {
+                update_dirty_bounds(&mut scene);
+            }
         }
 
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
-        let key = nsstring("Effect");
-        let _: () = msg_send![defaults, setInteger: effect as i64 forKey: key];
+        let key = nsstring("NeonEnabled");
+        let _: () = msg_send![defaults, setBool: enabled forKey: key];
     }
 }
 
@@ -655,8 +709,12 @@ fn register_controller_class() -> *const Class {
             change_volume as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
-            sel!(changeEffect:),
-            change_effect as extern "C" fn(&Object, Sel, id),
+            sel!(toggleFireworks:),
+            toggle_fireworks as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(toggleNeon:),
+            toggle_neon as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
             sel!(changeSound:),
@@ -675,7 +733,7 @@ fn register_controller_class() -> *const Class {
 }
 
 unsafe fn build_settings_window(controller: id) -> id {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 326.0));
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 346.0));
     let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
         frame,
         NSWindowStyleMask::NSTitledWindowMask | NSWindowStyleMask::NSClosableWindowMask,
@@ -691,26 +749,31 @@ unsafe fn build_settings_window(controller: id) -> id {
     let title: id = msg_send![class!(NSTextField), labelWithString: nsstring("Mac Fireworks")];
     let font: id = msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64];
     let _: () = msg_send![title, setFont: font];
-    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 280.0), NSSize::new(280.0, 20.0))];
+    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 300.0), NSSize::new(280.0, 20.0))];
     let _: () = msg_send![content, addSubview: title];
 
-    // Chọn hiệu ứng: Fireworks (click) hay Neon trail (theo con trỏ)
-    let effect_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Effect")];
-    let _: () = msg_send![effect_label, setFrame: NSRect::new(NSPoint::new(20.0, 248.0), NSSize::new(70.0, 18.0))];
-    let _: () = msg_send![content, addSubview: effect_label];
-
-    let popup: id = msg_send![class!(NSPopUpButton), alloc];
-    let popup: id = msg_send![
-        popup,
-        initWithFrame: NSRect::new(NSPoint::new(100.0, 242.0), NSSize::new(200.0, 26.0))
-        pullsDown: NO
+    // Hai hiệu ứng bật/tắt độc lập: có thể bật cả hai cùng lúc
+    let fireworks_box: id = msg_send![
+        class!(NSButton),
+        checkboxWithTitle: nsstring("Fireworks on click")
+        target: controller
+        action: sel!(toggleFireworks:)
     ];
-    let _: () = msg_send![popup, addItemWithTitle: nsstring("Fireworks")];
-    let _: () = msg_send![popup, addItemWithTitle: nsstring("Neon trail")];
-    let _: () = msg_send![popup, selectItemAtIndex: effect_index()];
-    let _: () = msg_send![popup, setTarget: controller];
-    let _: () = msg_send![popup, setAction: sel!(changeEffect:)];
-    let _: () = msg_send![content, addSubview: popup];
+    let state: i64 = if fireworks_on() { 1 } else { 0 };
+    let _: () = msg_send![fireworks_box, setState: state];
+    let _: () = msg_send![fireworks_box, setFrame: NSRect::new(NSPoint::new(20.0, 268.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![content, addSubview: fireworks_box];
+
+    let neon_box: id = msg_send![
+        class!(NSButton),
+        checkboxWithTitle: nsstring("Neon trail follows cursor")
+        target: controller
+        action: sel!(toggleNeon:)
+    ];
+    let state: i64 = if neon_on() { 1 } else { 0 };
+    let _: () = msg_send![neon_box, setState: state];
+    let _: () = msg_send![neon_box, setFrame: NSRect::new(NSPoint::new(20.0, 242.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![content, addSubview: neon_box];
 
     // Skin của dải neon: Classic (dải neon mượt) hay Pixel love (tim pixel)
     let skin_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Skin")];
@@ -733,9 +796,8 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![skin_popup, setAction: sel!(changeSkin:)];
     let _: () = msg_send![content, addSubview: skin_popup];
 
-    // Skin chỉ hiện khi effect đang là Neon trail
-    let neon = EFFECT.load(Ordering::Relaxed) == EFFECT_NEON;
-    let hidden = if neon { NO } else { YES };
+    // Skin chỉ hiện khi neon trail đang bật
+    let hidden = if neon_on() { NO } else { YES };
     let _: () = msg_send![skin_label, setHidden: hidden];
     let _: () = msg_send![skin_popup, setHidden: hidden];
     let _ = SKIN_LABEL.set(skin_label as usize);
@@ -759,6 +821,8 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![sound_popup, setTarget: controller];
     let _: () = msg_send![sound_popup, setAction: sel!(changeSound:)];
     let _: () = msg_send![content, addSubview: sound_popup];
+    let _ = SOUND_LABEL.set(sound_label as usize);
+    let _ = SOUND_POPUP.set(sound_popup as usize);
 
     let checkbox: id = msg_send![
         class!(NSButton),
@@ -770,10 +834,12 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![checkbox, setState: state];
     let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 136.0), NSSize::new(280.0, 22.0))];
     let _: () = msg_send![content, addSubview: checkbox];
+    let _ = SOUND_CHECKBOX.set(checkbox as usize);
 
     let volume_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Volume")];
     let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 108.0), NSSize::new(120.0, 18.0))];
     let _: () = msg_send![content, addSubview: volume_label];
+    let _ = VOLUME_TITLE.set(volume_label as usize);
 
     // Phần trăm âm lượng hiện tại, cập nhật ngay khi kéo slider
     let percent_text = format!("{}%", (sound_volume() * 100.0).round() as i32);
@@ -796,8 +862,12 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![slider, setTarget: controller];
     let _: () = msg_send![slider, setAction: sel!(changeVolume:)];
     let _: () = msg_send![content, addSubview: slider];
+    let _ = VOLUME_SLIDER.set(slider as usize);
 
-    let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Click = firework, Neon = trail follows cursor.")];
+    // Chọn âm thanh + âm lượng chỉ hiện khi pháo hoa click đang bật
+    set_sound_rows_hidden(!fireworks_on());
+
+    let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Both effects can be enabled at the same time.")];
     let _: () = msg_send![hint, setFrame: NSRect::new(NSPoint::new(20.0, 56.0), NSSize::new(280.0, 18.0))];
     let color: id = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![hint, setTextColor: color];
@@ -1131,7 +1201,7 @@ fn update_dirty_bounds(scene: &mut Scene) {
     for particle in scene.particles.iter() {
         include(particle.x, particle.y, particle.size * 4.4 + 6.0);
     }
-    if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON && !EFFECT_HIDDEN.load(Ordering::Relaxed) {
+    if neon_on() && !EFFECT_HIDDEN.load(Ordering::Relaxed) {
         // Dải sáng: nửa bề rộng quầng lớn nhất (48/2) + làm mượt + khử răng cưa,
         // và quầng đầu dải (bán kính 30)
         for point in scene.trail.iter() {
@@ -1624,7 +1694,7 @@ fn tick() {
         p.life > 0.0
     });
 
-    if EFFECT.load(Ordering::Relaxed) != EFFECT_NEON {
+    if !neon_on() {
         scene.trail.clear();
         scene.head_init = false;
         scene.idle_secs = 0.0;
@@ -1870,7 +1940,7 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
         }
 
         // Dải sáng neon bám theo con trỏ
-        if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON
+        if neon_on()
             && !EFFECT_HIDDEN.load(Ordering::Relaxed)
             && scene.trail.len() > 2
         {
@@ -1985,12 +2055,12 @@ fn main() {
         // Tiếng click, hiệu ứng, panel settings và icon trên menu bar
         load_sound_preference();
         load_sound_kind_preference();
-        load_effect_preference();
+        load_effect_preferences();
         load_skin_preference();
         load_sounds();
 
-        // Quả pháo chào ngay khi mở app (chỉ ở chế độ Fireworks)
-        if EFFECT.load(Ordering::Relaxed) == EFFECT_FIREWORKS {
+        // Quả pháo chào ngay khi mở app (nếu pháo hoa đang bật)
+        if fireworks_on() {
             spawn_firework(
                 main_display_bounds.size.width / 2.0,
                 screen_height / 2.0,
@@ -2015,7 +2085,7 @@ fn main() {
                     match etype {
                         CGEventType::MouseMoved | CGEventType::LeftMouseDragged => {
                             // Ghi mẫu vị trí thật để dải neon bám đúng đường đi
-                            if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON {
+                            if neon_on() {
                                 let loc = event.location();
                                 push_mouse_sample(
                                     loc.x,
@@ -2036,7 +2106,7 @@ fn main() {
                         _ => {
                             let loc = event.location();
                             let cocoa_y = screen_height - loc.y;
-                            if EFFECT.load(Ordering::Relaxed) == EFFECT_FIREWORKS {
+                            if fireworks_on() {
                                 spawn_firework(loc.x, cocoa_y);
                             }
                             // Phát tiếng ở main thread (trong timer) để không đụng AppKit từ thread này
