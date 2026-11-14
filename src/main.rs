@@ -8,6 +8,7 @@ use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun};
+use core_graphics::display::{CGDisplayBounds, CGMainDisplayID};
 use core_graphics::event::{
     CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
 };
@@ -665,8 +666,21 @@ unsafe fn fill_oval(cx: f64, cy: f64, radius: f64, r: f64, g: f64, b: f64, alpha
     let _: () = msg_send![path, fill];
 }
 
-extern "C" fn draw_rect(_this: &Object, _sel: Sel, _rect: NSRect) {
+extern "C" fn draw_rect(this: &Object, _sel: Sel, _rect: NSRect) {
     unsafe {
+        // Mỗi màn hình có một cửa sổ riêng. Hạt lưu ở toạ độ toàn cục (gốc là góc
+        // dưới-trái màn hình chính), nên phải trừ gốc cửa sổ này đi mới vẽ đúng chỗ.
+        let window: id = msg_send![this as *const Object as id, window];
+        let frame: NSRect = if window != nil {
+            msg_send![window, frame]
+        } else {
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
+        };
+        let offset_x = frame.origin.x;
+        let offset_y = frame.origin.y;
+        let max_x = frame.size.width;
+        let max_y = frame.size.height;
+
         let mut scene = match get_scene().lock() {
             Ok(scene) => scene,
             Err(poisoned) => poisoned.into_inner(),
@@ -696,21 +710,28 @@ extern "C" fn draw_rect(_this: &Object, _sel: Sel, _rect: NSRect) {
         });
 
         for p in scene.particles.iter() {
+            let x = p.x - offset_x;
+            let y = p.y - offset_y;
+            // Hạt nằm ngoài màn hình của cửa sổ này thì bỏ qua
+            if x < -40.0 || y < -40.0 || x > max_x + 40.0 || y > max_y + 40.0 {
+                continue;
+            }
+
             let fade = p.life.powf(1.35);
             let twinkle = 0.45 + 0.55 * (0.5 + 0.5 * p.twinkle_phase.sin());
             let alpha = (fade * twinkle).clamp(0.0, 1.0);
             let core = p.size * (0.35 + 0.65 * p.life);
 
             // Quầng sáng neon nhiều lớp: toả mềm ra xung quanh
-            fill_oval(p.x, p.y, core * 4.4, p.r, p.g, p.b, alpha * 0.06);
-            fill_oval(p.x, p.y, core * 2.7, p.r, p.g, p.b, alpha * 0.12);
-            fill_oval(p.x, p.y, core * 1.7, p.r, p.g, p.b, alpha * 0.24);
+            fill_oval(x, y, core * 4.4, p.r, p.g, p.b, alpha * 0.06);
+            fill_oval(x, y, core * 2.7, p.r, p.g, p.b, alpha * 0.12);
+            fill_oval(x, y, core * 1.7, p.r, p.g, p.b, alpha * 0.24);
 
             // Ruột nóng: pha trắng để hạt trông "phát sáng"
             let hot_r = p.r + (1.0 - p.r) * 0.7;
             let hot_g = p.g + (1.0 - p.g) * 0.7;
             let hot_b = p.b + (1.0 - p.b) * 0.7;
-            fill_oval(p.x, p.y, core * 0.85, hot_r, hot_g, hot_b, alpha * 0.95);
+            fill_oval(x, y, core * 0.85, hot_r, hot_g, hot_b, alpha * 0.95);
         }
     }
 }
@@ -735,34 +756,54 @@ fn main() {
         let app = NSApp();
         app.setActivationPolicy_(NSApplicationActivationPolicyAccessory);
 
-        let main_screen: id = msg_send![class!(NSScreen), mainScreen];
-        let screen_frame: NSRect = msg_send![main_screen, frame];
-        let screen_height = screen_frame.size.height;
+        // Không dùng [NSScreen mainScreen]: nó trả về màn hình đang có cửa sổ nhận
+        // phím (có thể là màn phụ), làm sai phép lật trục Y. CGEvent dùng toạ độ
+        // gốc ở góc trên-trái của màn hình chính, nên lấy đúng chiều cao của nó.
+        let main_display_bounds = CGDisplayBounds(CGMainDisplayID());
+        let screen_height = main_display_bounds.size.height;
 
-        let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
-            screen_frame,
-            NSWindowStyleMask::NSBorderlessWindowMask,
-            NSBackingStoreBuffered,
-            NO,
-        );
-        window.setBackgroundColor_(NSColor::clearColor(nil));
-        window.setOpaque_(NO);
-        window.setIgnoresMouseEvents_(YES);
-        window.setLevel_(1000);
-        window.setCollectionBehavior_(
-            NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
-                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorStationary,
-        );
-
+        // Mỗi màn hình (MacBook, màn hình ngoài qua DP/HDMI...) một cửa sổ overlay riêng
         let view_class = register_view_class();
-        let view: id = msg_send![view_class, alloc];
-        let view: id = msg_send![view, initWithFrame: screen_frame];
-        window.setContentView_(view);
-        window.makeKeyAndOrderFront_(nil);
+        let mut views: Vec<usize> = Vec::new();
+        let screens: id = msg_send![class!(NSScreen), screens];
+        let screen_count: usize = msg_send![screens, count];
+        for index in 0..screen_count {
+            let screen: id = msg_send![screens, objectAtIndex: index];
+            let frame: NSRect = msg_send![screen, frame];
+
+            let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
+                frame,
+                NSWindowStyleMask::NSBorderlessWindowMask,
+                NSBackingStoreBuffered,
+                NO,
+            );
+            window.setBackgroundColor_(NSColor::clearColor(nil));
+            window.setOpaque_(NO);
+            window.setIgnoresMouseEvents_(YES);
+            window.setLevel_(1000);
+            window.setCollectionBehavior_(
+                NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
+                    | NSWindowCollectionBehavior::NSWindowCollectionBehaviorStationary,
+            );
+
+            let view: id = msg_send![view_class, alloc];
+            let view: id = msg_send![
+                view,
+                initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), frame.size)
+            ];
+            window.setContentView_(view);
+            window.makeKeyAndOrderFront_(nil);
+            views.push(view as usize);
+        }
+
+        eprintln!("Overlay đã tạo cho {} màn hình.", views.len());
 
         // Một quả pháo chào ngay khi mở app: thấy được hiệu ứng kể cả khi
         // chưa cấp quyền Trợ năng.
-        spawn_firework(screen_frame.size.width / 2.0, screen_height / 2.0);
+        spawn_firework(
+            main_display_bounds.size.width / 2.0,
+            screen_height / 2.0,
+        );
 
         // Tiếng click, panel settings và icon trên menu bar
         load_sound_preference();
@@ -813,13 +854,14 @@ fn main() {
             eprintln!("Đang chạy chế độ chỉ hiển thị pháo hoa, click chưa được theo dõi.");
         }
 
-        let view_ptr = view as usize;
         let timer_block = block::ConcreteBlock::new(move |_timer: id| {
             if SOUND_PENDING.swap(false, Ordering::Relaxed) {
                 play_click_sound();
             }
-            let v = view_ptr as id;
-            let _: () = msg_send![v, setNeedsDisplay: YES];
+            for view in &views {
+                let v = *view as id;
+                let _: () = msg_send![v, setNeedsDisplay: YES];
+            }
         })
         .copy();
 
