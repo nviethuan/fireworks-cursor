@@ -7,5 +7,5 @@
 ## Settings
 
 <p align="center">
-  <img src="demo/settings.gif" alt="Settings" width="500">
+  <img src="demo/settings.png" alt="Settings" width="500">
 </p>

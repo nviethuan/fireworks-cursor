@@ -151,6 +151,172 @@ fn load_sound_preference() {
     }
 }
 
+// ---------- CoreAudio: thiết bị ra mặc định ----------
+
+#[repr(C)]
+struct AudioObjectPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+#[link(name = "CoreAudio", kind = "framework")]
+extern "C" {
+    fn AudioObjectGetPropertyData(
+        object_id: u32,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_data_size: u32,
+        qualifier_data: *const std::ffi::c_void,
+        data_size: *mut u32,
+        data: *mut std::ffi::c_void,
+    ) -> i32;
+
+    fn AudioObjectGetPropertyDataSize(
+        object_id: u32,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_data_size: u32,
+        qualifier_data: *const std::ffi::c_void,
+        data_size: *mut u32,
+    ) -> i32;
+}
+
+const K_AUDIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
+const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+const K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
+const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE: u32 = u32::from_be_bytes(*b"dOut");
+const K_AUDIO_DEVICE_PROPERTY_DEVICE_UID: u32 = u32::from_be_bytes(*b"uid ");
+const K_AUDIO_HARDWARE_PROPERTY_DEVICES: u32 = u32::from_be_bytes(*b"dev#");
+const K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE: u32 = u32::from_be_bytes(*b"tran");
+const K_AUDIO_DEVICE_TRANSPORT_TYPE_BUILT_IN: u32 = u32::from_be_bytes(*b"bltn");
+const K_AUDIO_DEVICE_PROPERTY_STREAMS: u32 = u32::from_be_bytes(*b"stm#");
+const K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT: u32 = u32::from_be_bytes(*b"outp");
+
+/// UID của loa/headphone đang là output mặc định (ví dụ loa Bluetooth).
+unsafe fn default_output_device_uid() -> Option<id> {
+    let address = AudioObjectPropertyAddress {
+        selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
+        scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    let mut device: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = AudioObjectGetPropertyData(
+        K_AUDIO_OBJECT_SYSTEM_OBJECT,
+        &address,
+        0,
+        std::ptr::null(),
+        &mut size,
+        &mut device as *mut u32 as *mut std::ffi::c_void,
+    );
+    if status != 0 || device == 0 {
+        return None;
+    }
+
+    device_uid(device)
+}
+
+/// UID của một thiết bị âm thanh bất kỳ.
+unsafe fn device_uid(device: u32) -> Option<id> {
+    let address = AudioObjectPropertyAddress {
+        selector: K_AUDIO_DEVICE_PROPERTY_DEVICE_UID,
+        scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+    let mut uid: *const std::ffi::c_void = std::ptr::null();
+    let mut size = std::mem::size_of::<*const std::ffi::c_void>() as u32;
+    let status = AudioObjectGetPropertyData(
+        device,
+        &address,
+        0,
+        std::ptr::null(),
+        &mut size,
+        &mut uid as *mut _ as *mut std::ffi::c_void,
+    );
+    if status != 0 || uid.is_null() {
+        return None;
+    }
+    Some(uid as id)
+}
+
+/// UID của loa trong của máy (built-in output), bỏ qua micro built-in và mọi thiết bị ngoài.
+unsafe fn builtin_output_uid() -> Option<id> {
+    let address = AudioObjectPropertyAddress {
+        selector: K_AUDIO_HARDWARE_PROPERTY_DEVICES,
+        scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    let mut size: u32 = 0;
+    if AudioObjectGetPropertyDataSize(
+        K_AUDIO_OBJECT_SYSTEM_OBJECT,
+        &address,
+        0,
+        std::ptr::null(),
+        &mut size,
+    ) != 0
+        || size < 4
+    {
+        return None;
+    }
+
+    let mut devices: Vec<u32> = vec![0; (size / 4) as usize];
+    if AudioObjectGetPropertyData(
+        K_AUDIO_OBJECT_SYSTEM_OBJECT,
+        &address,
+        0,
+        std::ptr::null(),
+        &mut size,
+        devices.as_mut_ptr() as *mut std::ffi::c_void,
+    ) != 0
+    {
+        return None;
+    }
+
+    for device in devices {
+        let transport_address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let mut transport: u32 = 0;
+        let mut value_size = std::mem::size_of::<u32>() as u32;
+        if AudioObjectGetPropertyData(
+            device,
+            &transport_address,
+            0,
+            std::ptr::null(),
+            &mut value_size,
+            &mut transport as *mut u32 as *mut std::ffi::c_void,
+        ) != 0
+        {
+            continue;
+        }
+        if transport != K_AUDIO_DEVICE_TRANSPORT_TYPE_BUILT_IN {
+            continue;
+        }
+
+        // Chỉ nhận thiết bị có đường ra (loa), tránh micro của máy
+        let streams_address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_STREAMS,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let mut stream_size: u32 = 0;
+        if AudioObjectGetPropertyDataSize(device, &streams_address, 0, std::ptr::null(), &mut stream_size) != 0
+            || stream_size == 0
+        {
+            continue;
+        }
+
+        if let Some(uid) = device_uid(device) {
+            return Some(uid);
+        }
+    }
+
+    None
+}
+
 /// Nạp sẵn vài bản sao để click liên tiếp vẫn phát, không cắt tiếng của nhau.
 fn load_sounds() {
     let mut pool: Vec<usize> = Vec::with_capacity(4);
@@ -164,11 +330,27 @@ fn load_sounds() {
         if path == nil {
             eprintln!("Không thấy click.wav trong bundle: app sẽ chạy không tiếng.");
         } else {
+            // Ghim phát ra loa trong của máy. Nếu để NSSound tự chọn, nó đi theo đường
+            // "alert sound" và có thể ra cả Bluetooth/AirPlay — mỗi lần đánh thức thiết bị
+            // ngoài là một lần macOS hiện HUD âm lượng.
+            let device_uid = match builtin_output_uid() {
+                Some(uid) => Some(uid),
+                None => {
+                    eprintln!("Không tìm thấy loa trong của máy: phát ra thiết bị ra mặc định.");
+                    default_output_device_uid()
+                }
+            };
+            if device_uid.is_none() {
+                eprintln!("Không đọc được thiết bị âm thanh: dùng đường phát mặc định.");
+            }
             for _ in 0..4 {
                 let sound: id = msg_send![class!(NSSound), alloc];
                 let sound: id = msg_send![sound, initWithContentsOfFile: path byReference: YES];
                 if sound != nil {
                     let _: () = msg_send![sound, setVolume: sound_volume()];
+                    if let Some(uid) = device_uid {
+                        let _: () = msg_send![sound, setPlaybackDeviceIdentifier: uid];
+                    }
                     pool.push(sound as usize);
                 }
             }
@@ -187,10 +369,18 @@ fn play_click_sound() {
     if pool.is_empty() {
         return;
     }
-    let index = SOUND_NEXT.fetch_add(1, Ordering::Relaxed) % pool.len();
+    let start = SOUND_NEXT.fetch_add(1, Ordering::Relaxed) % pool.len();
     unsafe {
-        let sound = pool[index] as id;
-        let _: () = msg_send![sound, stop];
+        // Ưu tiên bản đang rảnh: không stop() để khỏi đóng/mở lại stream âm thanh
+        for offset in 0..pool.len() {
+            let sound = pool[(start + offset) % pool.len()] as id;
+            let playing: bool = msg_send![sound, isPlaying];
+            if !playing {
+                let _: bool = msg_send![sound, play];
+                return;
+            }
+        }
+        let sound = pool[start] as id;
         let _: bool = msg_send![sound, play];
     }
 }
