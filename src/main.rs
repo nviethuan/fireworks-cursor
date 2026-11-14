@@ -126,6 +126,7 @@ static EFFECT: AtomicU8 = AtomicU8::new(EFFECT_FIREWORKS);
 
 const SKIN_CLASSIC: u8 = 0;
 const SKIN_PIXEL_LOVE: u8 = 1;
+const SKIN_CALLIGRAPHY: u8 = 2;
 
 static SKIN: AtomicU8 = AtomicU8::new(SKIN_CLASSIC);
 /// Con trỏ có đang được hiển thị không (video fullscreen sẽ ẩn con trỏ)
@@ -185,10 +186,10 @@ fn load_skin_preference() {
         let stored: id = msg_send![defaults, objectForKey: key];
         if stored != nil {
             let value: i64 = msg_send![defaults, integerForKey: key];
-            let skin = if value == SKIN_PIXEL_LOVE as i64 {
-                SKIN_PIXEL_LOVE
-            } else {
-                SKIN_CLASSIC
+            let skin = match value {
+                1 => SKIN_PIXEL_LOVE,
+                2 => SKIN_CALLIGRAPHY,
+                _ => SKIN_CLASSIC,
             };
             SKIN.store(skin, Ordering::Relaxed);
         }
@@ -196,10 +197,10 @@ fn load_skin_preference() {
 }
 
 fn skin_index() -> i64 {
-    if SKIN.load(Ordering::Relaxed) == SKIN_PIXEL_LOVE {
-        1
-    } else {
-        0
+    match SKIN.load(Ordering::Relaxed) {
+        SKIN_PIXEL_LOVE => 1,
+        SKIN_CALLIGRAPHY => 2,
+        _ => 0,
     }
 }
 
@@ -534,10 +535,10 @@ extern "C" fn change_effect(_this: &Object, _sel: Sel, sender: id) {
 extern "C" fn change_skin(_this: &Object, _sel: Sel, sender: id) {
     unsafe {
         let index: i64 = msg_send![sender, indexOfSelectedItem];
-        let skin = if index == 1 {
-            SKIN_PIXEL_LOVE
-        } else {
-            SKIN_CLASSIC
+        let skin = match index {
+            1 => SKIN_PIXEL_LOVE,
+            2 => SKIN_CALLIGRAPHY,
+            _ => SKIN_CLASSIC,
         };
         SKIN.store(skin, Ordering::Relaxed);
 
@@ -641,6 +642,7 @@ unsafe fn build_settings_window(controller: id) -> id {
     ];
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Classic")];
     let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Pixel love")];
+    let _: () = msg_send![skin_popup, addItemWithTitle: nsstring("Calligraphy brush")];
     let _: () = msg_send![skin_popup, selectItemAtIndex: skin_index()];
     let _: () = msg_send![skin_popup, setTarget: controller];
     let _: () = msg_send![skin_popup, setAction: sel!(changeSkin:)];
@@ -1190,6 +1192,132 @@ unsafe fn draw_pixel_trail(points: &[(f64, f64)]) {
     }
 }
 
+/// Vẽ một lớp của nét cọ: dựng dải kín từ trục các điểm, bề rộng do `half_width`
+/// quyết định — bề rộng không đều nên mép trông như vết cọ thật.
+unsafe fn fill_brush_layer<F>(
+    context: &CGContext,
+    points: &[(f64, f64)],
+    half_width: F,
+    r: f64,
+    g: f64,
+    b: f64,
+    alpha: f64,
+) where
+    F: Fn(usize, f64) -> f64,
+{
+    let count = points.len();
+    if count < 2 {
+        return;
+    }
+
+    context.begin_path();
+    for i in 0..count {
+        let (nx, ny) = ribbon_normal(points, i);
+        let t = i as f64 / (count - 1) as f64;
+        let hw = half_width(i, t).max(0.0);
+        let x = points[i].0 + nx * hw;
+        let y = points[i].1 + ny * hw;
+        if i == 0 {
+            context.move_to_point(x, y);
+        } else {
+            context.add_line_to_point(x, y);
+        }
+    }
+    for i in (0..count).rev() {
+        let (nx, ny) = ribbon_normal(points, i);
+        let t = i as f64 / (count - 1) as f64;
+        let hw = half_width(i, t).max(0.0);
+        context.add_line_to_point(points[i].0 - nx * hw, points[i].1 - ny * hw);
+    }
+    context.close_path();
+    context.set_rgb_fill_color(r, g, b, alpha);
+    context.fill_path();
+}
+
+/// Nhiễu tất định (0..1) theo chỉ số điểm — mép cọ nhấp nhô mà vẫn ổn định.
+fn brush_noise(i: usize) -> f64 {
+    let v = (i as f64 * 12.9898 + 78.233).sin() * 43758.5453;
+    (v - v.floor()).abs()
+}
+
+/// Skin "Calligraphy brush": nét mực đen loang, mép không đều, đầu cọ đậm, kèm
+/// vài đốm mực bắn ra hai bên như bút lông thật.
+unsafe fn draw_brush_trail(points: &[(f64, f64)]) {
+    let count = points.len();
+    if count < 2 {
+        return;
+    }
+    let Some(context) = current_cg_context() else {
+        return;
+    };
+
+    let profile = |i: usize, t: f64| -> f64 {
+        // dày dần về phía đầu, mép nhấp nhô theo nhiễu tất định
+        (2.2 + 8.5 * t) * (0.72 + 0.45 * brush_noise(i))
+    };
+
+    // Viền sáng rất nhẹ để nét mực vẫn thấy trên nền tối
+    fill_brush_layer(
+        &context,
+        points,
+        |i, t| profile(i, t) * 1.7,
+        0.92,
+        0.92,
+        0.96,
+        0.08,
+    );
+
+    // Quầng mực loang -> thân mực -> lõi đậm
+    fill_brush_layer(
+        &context,
+        points,
+        |i, t| profile(i, t) * 1.35,
+        0.13,
+        0.13,
+        0.15,
+        0.12,
+    );
+    fill_brush_layer(&context, points, |i, t| profile(i, t), 0.09, 0.09, 0.11, 0.85);
+    fill_brush_layer(
+        &context,
+        points,
+        |i, t| profile(i, t) * 0.45,
+        0.03,
+        0.03,
+        0.04,
+        0.55,
+    );
+
+    // Đầu cọ: một chấm mực đậm ngay tại con trỏ
+    if let Some((hx, hy)) = points.last().copied() {
+        context.set_rgb_fill_color(0.04, 0.04, 0.05, 0.85);
+        context.fill_ellipse_in_rect(CGRect::new(
+            &CGPoint::new(hx - 3.2, hy - 3.2),
+            &CGSize::new(6.4, 6.4),
+        ));
+    }
+
+    // Mực bắn hai bên nét
+    let mut index = 6;
+    while index < count {
+        let n = brush_noise(index * 7 + 3);
+        if n > 0.42 {
+            let (nx, ny) = ribbon_normal(points, index);
+            let side = if n > 0.72 { 1.0 } else { -1.0 };
+            let offset = 6.0 + n * 15.0;
+            let radius = 0.7 + n * 1.7;
+            let x = points[index].0 + nx * offset * side;
+            let y = points[index].1 + ny * offset * side;
+            context.set_rgb_fill_color(0.06, 0.06, 0.08, 0.5);
+            context.fill_ellipse_in_rect(CGRect::new(
+                &CGPoint::new(x - radius, y - radius),
+                &CGSize::new(radius * 2.0, radius * 2.0),
+            ));
+        }
+        index += 9;
+    }
+}
+
 /// Mô phỏng một frame (gọi từ timer trên main thread, mỗi frame đúng một lần).
 fn tick() {
     let now = Instant::now();
@@ -1461,8 +1589,11 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
                 smooth.push(((a.0 + 2.0 * b.0 + c.0) / 4.0, (a.1 + 2.0 * b.1 + c.1) / 4.0));
             }
 
-            if SKIN.load(Ordering::Relaxed) == SKIN_PIXEL_LOVE {
+            let skin = SKIN.load(Ordering::Relaxed);
+            if skin == SKIN_PIXEL_LOVE {
                 draw_pixel_trail(&smooth);
+            } else if skin == SKIN_CALLIGRAPHY {
+                draw_brush_trail(&smooth);
             } else {
                 let (r, g, b) = neon_color(scene.hue_phase);
                 // Nhiều lớp, mỗi lớp là MỘT path kín: quầng -> thân -> ruột trắng
