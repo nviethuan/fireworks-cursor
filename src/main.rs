@@ -8,7 +8,10 @@ use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
 use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun};
+use core_graphics::context::CGContext;
 use core_graphics::display::{CGDisplayBounds, CGMainDisplayID};
+use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+use core_graphics::sys::CGContextRef;
 use core_graphics::event::{
     CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
 };
@@ -17,7 +20,7 @@ use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use rand::Rng;
 use std::f64::consts::TAU;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
@@ -32,6 +35,8 @@ extern "C" {
     fn CGRequestPostEventAccess() -> bool;
     fn CGPreflightListenEventAccess() -> bool;
     fn CGRequestListenEventAccess() -> bool;
+    fn CGCursorIsVisible() -> bool;
+    fn CGContextClearRect(context: CGContextRef, rect: CGRect);
 }
 
 fn os_major_version() -> u32 {
@@ -109,6 +114,21 @@ static SOUND_POOL: OnceLock<Vec<usize>> = OnceLock::new();
 static SOUND_NEXT: AtomicUsize = AtomicUsize::new(0);
 static SOUND_VOLUME_BITS: AtomicU32 = AtomicU32::new(0.45f32.to_bits());
 
+// ---------- Hiệu ứng ----------
+
+const EFFECT_FIREWORKS: u8 = 0;
+const EFFECT_NEON: u8 = 1;
+
+static EFFECT: AtomicU8 = AtomicU8::new(EFFECT_FIREWORKS);
+/// Con trỏ có đang được hiển thị không (video fullscreen sẽ ẩn con trỏ)
+static CURSOR_VISIBLE: AtomicBool = AtomicBool::new(true);
+
+/// Mẫu vị trí chuột (toạ độ Cocoa) do CGEventTap ghi lại, kèm thời điểm nhận.
+/// Tap bắt được mọi event chuột nên mẫu dày hơn nhiều so với 1 mẫu/frame.
+static MOUSE_SAMPLES: Mutex<Vec<MouseSample>> = Mutex::new(Vec::new());
+
+const MAX_MOUSE_SAMPLES: usize = 512;
+
 // ---------- Menu bar + panel settings ----------
 
 static SETTINGS_WINDOW: OnceLock<usize> = OnceLock::new();
@@ -131,6 +151,31 @@ fn set_sound_volume(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     SOUND_VOLUME_BITS.store(value.to_bits(), Ordering::Relaxed);
     value
+}
+
+fn load_effect_preference() {
+    unsafe {
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("Effect");
+        let stored: id = msg_send![defaults, objectForKey: key];
+        if stored != nil {
+            let value: i64 = msg_send![defaults, integerForKey: key];
+            let effect = if value == EFFECT_NEON as i64 {
+                EFFECT_NEON
+            } else {
+                EFFECT_FIREWORKS
+            };
+            EFFECT.store(effect, Ordering::Relaxed);
+        }
+    }
+}
+
+fn effect_index() -> i64 {
+    if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON {
+        1
+    } else {
+        0
+    }
 }
 
 fn load_sound_preference() {
@@ -429,6 +474,30 @@ extern "C" fn change_volume(_this: &Object, _sel: Sel, sender: id) {
     }
 }
 
+extern "C" fn change_effect(_this: &Object, _sel: Sel, sender: id) {
+    unsafe {
+        let index: i64 = msg_send![sender, indexOfSelectedItem];
+        let effect = if index == 1 {
+            EFFECT_NEON
+        } else {
+            EFFECT_FIREWORKS
+        };
+        EFFECT.store(effect, Ordering::Relaxed);
+
+        // Đổi hiệu ứng thì dọn cảnh cũ cho sạch
+        if let Ok(mut scene) = get_scene().lock() {
+            scene.particles.clear();
+            scene.trail.clear();
+            scene.head_init = false;
+            scene.idle_secs = 0.0;
+        }
+
+        let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+        let key = nsstring("Effect");
+        let _: () = msg_send![defaults, setInteger: effect as i64 forKey: key];
+    }
+}
+
 extern "C" fn quit_app(_this: &Object, _sel: Sel, _sender: id) {
     unsafe {
         let _: () = msg_send![NSApp(), terminate: nil];
@@ -451,6 +520,10 @@ fn register_controller_class() -> *const Class {
             change_volume as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
+            sel!(changeEffect:),
+            change_effect as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
             sel!(quitApp:),
             quit_app as extern "C" fn(&Object, Sel, id),
         );
@@ -459,7 +532,7 @@ fn register_controller_class() -> *const Class {
 }
 
 unsafe fn build_settings_window(controller: id) -> id {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 212.0));
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(320.0, 252.0));
     let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
         frame,
         NSWindowStyleMask::NSTitledWindowMask | NSWindowStyleMask::NSClosableWindowMask,
@@ -472,11 +545,29 @@ unsafe fn build_settings_window(controller: id) -> id {
 
     let content: id = msg_send![window, contentView];
 
-    let title: id = msg_send![class!(NSTextField), labelWithString: nsstring("Fireworks on click")];
+    let title: id = msg_send![class!(NSTextField), labelWithString: nsstring("Mac Fireworks")];
     let font: id = msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64];
     let _: () = msg_send![title, setFont: font];
-    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 166.0), NSSize::new(280.0, 20.0))];
+    let _: () = msg_send![title, setFrame: NSRect::new(NSPoint::new(20.0, 206.0), NSSize::new(280.0, 20.0))];
     let _: () = msg_send![content, addSubview: title];
+
+    // Chọn hiệu ứng: Fireworks (click) hay Neon trail (theo con trỏ)
+    let effect_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Effect")];
+    let _: () = msg_send![effect_label, setFrame: NSRect::new(NSPoint::new(20.0, 176.0), NSSize::new(70.0, 18.0))];
+    let _: () = msg_send![content, addSubview: effect_label];
+
+    let popup: id = msg_send![class!(NSPopUpButton), alloc];
+    let popup: id = msg_send![
+        popup,
+        initWithFrame: NSRect::new(NSPoint::new(100.0, 170.0), NSSize::new(200.0, 26.0))
+        pullsDown: NO
+    ];
+    let _: () = msg_send![popup, addItemWithTitle: nsstring("Fireworks")];
+    let _: () = msg_send![popup, addItemWithTitle: nsstring("Neon trail")];
+    let _: () = msg_send![popup, selectItemAtIndex: effect_index()];
+    let _: () = msg_send![popup, setTarget: controller];
+    let _: () = msg_send![popup, setAction: sel!(changeEffect:)];
+    let _: () = msg_send![content, addSubview: popup];
 
     let checkbox: id = msg_send![
         class!(NSButton),
@@ -486,11 +577,11 @@ unsafe fn build_settings_window(controller: id) -> id {
     ];
     let state: i64 = if sound_enabled() { 1 } else { 0 };
     let _: () = msg_send![checkbox, setState: state];
-    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 136.0), NSSize::new(280.0, 22.0))];
+    let _: () = msg_send![checkbox, setFrame: NSRect::new(NSPoint::new(20.0, 140.0), NSSize::new(280.0, 22.0))];
     let _: () = msg_send![content, addSubview: checkbox];
 
     let volume_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Volume")];
-    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 110.0), NSSize::new(120.0, 18.0))];
+    let _: () = msg_send![volume_label, setFrame: NSRect::new(NSPoint::new(20.0, 112.0), NSSize::new(120.0, 18.0))];
     let _: () = msg_send![content, addSubview: volume_label];
 
     // Phần trăm âm lượng hiện tại, cập nhật ngay khi kéo slider
@@ -501,12 +592,12 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![percent, setAlignment: 2i64];
     let percent_color: id = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![percent, setTextColor: percent_color];
-    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 110.0), NSSize::new(60.0, 18.0))];
+    let _: () = msg_send![percent, setFrame: NSRect::new(NSPoint::new(240.0, 112.0), NSSize::new(60.0, 18.0))];
     let _: () = msg_send![content, addSubview: percent];
     let _ = VOLUME_LABEL.set(percent as usize);
 
     let slider: id = msg_send![class!(NSSlider), alloc];
-    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(20.0, 84.0), NSSize::new(280.0, 24.0))];
+    let slider: id = msg_send![slider, initWithFrame: NSRect::new(NSPoint::new(20.0, 86.0), NSSize::new(280.0, 24.0))];
     let _: () = msg_send![slider, setMinValue: 0.0f64];
     let _: () = msg_send![slider, setMaxValue: 1.0f64];
     let _: () = msg_send![slider, setDoubleValue: sound_volume() as f64];
@@ -515,7 +606,7 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _: () = msg_send![slider, setAction: sel!(changeVolume:)];
     let _: () = msg_send![content, addSubview: slider];
 
-    let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Each click fires a neon firework across the screen.")];
+    let hint: id = msg_send![class!(NSTextField), labelWithString: nsstring("Click fires a firework; Neon trail follows your cursor.")];
     let _: () = msg_send![hint, setFrame: NSRect::new(NSPoint::new(20.0, 58.0), NSSize::new(280.0, 18.0))];
     let color: id = msg_send![class!(NSColor), secondaryLabelColor];
     let _: () = msg_send![hint, setTextColor: color];
@@ -573,8 +664,43 @@ struct Particle {
     twinkle_speed: f64,
 }
 
+type MouseSample = (f64, f64, Instant);
+
+fn push_mouse_sample(x: f64, y: f64, at: Instant) {
+    let mut buffer = match MOUSE_SAMPLES.lock() {
+        Ok(buffer) => buffer,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if buffer.len() >= MAX_MOUSE_SAMPLES {
+        let excess = buffer.len() - MAX_MOUSE_SAMPLES + 1;
+        buffer.drain(0..excess);
+    }
+    buffer.push((x, y, at));
+}
+
+fn take_mouse_samples() -> Vec<MouseSample> {
+    match MOUSE_SAMPLES.lock() {
+        Ok(mut buffer) => std::mem::take(&mut *buffer),
+        Err(poisoned) => {
+            let mut buffer = poisoned.into_inner();
+            std::mem::take(&mut *buffer)
+        }
+    }
+}
+
+struct TrailPoint {
+    x: f64,
+    y: f64,
+    life: f64,
+}
+
 struct Scene {
     particles: Vec<Particle>,
+    trail: Vec<TrailPoint>,
+    head: (f64, f64),
+    head_init: bool,
+    idle_secs: f64,
+    hue_phase: f64,
     last_frame: Option<Instant>,
 }
 
@@ -584,6 +710,11 @@ fn get_scene() -> &'static Mutex<Scene> {
     SCENE.get_or_init(|| {
         Mutex::new(Scene {
             particles: Vec::with_capacity(600),
+            trail: Vec::with_capacity(320),
+            head: (0.0, 0.0),
+            head_init: false,
+            idle_secs: 0.0,
+            hue_phase: 0.0,
             last_frame: None,
         })
     })
@@ -645,25 +776,289 @@ fn spawn_firework(x: f64, y: f64) {
     }
 }
 
-unsafe fn fill_oval(cx: f64, cy: f64, radius: f64, r: f64, g: f64, b: f64, alpha: f64) {
+/// Màu neon chạy vòng theo hue (0..1).
+fn neon_color(phase: f64) -> (f64, f64, f64) {
+    let h = (phase.fract() + 1.0).fract() * 6.0;
+    let x = 1.0 - (h % 2.0 - 1.0).abs();
+    match h as u32 {
+        0 => (1.0, x, 0.35),
+        1 => (x, 1.0, 0.35),
+        2 => (0.35, 1.0, x),
+        3 => (0.35, x, 1.0),
+        4 => (x, 0.35, 1.0),
+        _ => (1.0, 0.35, x),
+    }
+}
+
+/// Pháp tuyến đơn vị của đường tại điểm `i` (dùng để dựng hai biên của dải).
+fn ribbon_normal(points: &[(f64, f64)], i: usize) -> (f64, f64) {
+    let prev = points[i.saturating_sub(1)];
+    let next = points[(i + 1).min(points.len() - 1)];
+    let dx = next.0 - prev.0;
+    let dy = next.1 - prev.1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.0001 {
+        (0.0, 0.0)
+    } else {
+        (-dy / len, dx / len)
+    }
+}
+
+/// Vẽ cả dải sáng thành **một** path kín (viền trái + viền phải), thuôn dần
+/// về phía đuôi. Một lần fill nên không có mối nối, không bị "hạt".
+unsafe fn fill_ribbon(
+    points: &[(f64, f64)],
+    max_width: f64,
+    r: f64,
+    g: f64,
+    b: f64,
+    alpha: f64,
+) {
+    let count = points.len();
+    if count < 2 || alpha <= 0.004 || max_width <= 0.2 {
+        return;
+    }
+
+    let half_width = |i: usize| -> f64 {
+        let t = i as f64 / (count - 1) as f64; // 0 = đuôi, 1 = đầu
+        max_width * 0.5 * t.powf(0.7)
+    };
+
+    let Some(context) = current_cg_context() else {
+        return;
+    };
+
+    for i in 0..count {
+        let (nx, ny) = ribbon_normal(points, i);
+        let hw = half_width(i);
+        let x = points[i].0 + nx * hw;
+        let y = points[i].1 + ny * hw;
+        if i == 0 {
+            context.move_to_point(x, y);
+        } else {
+            context.add_line_to_point(x, y);
+        }
+    }
+    for i in (0..count).rev() {
+        let (nx, ny) = ribbon_normal(points, i);
+        let hw = half_width(i);
+        context.add_line_to_point(points[i].0 - nx * hw, points[i].1 - ny * hw);
+    }
+    context.close_path();
+
+    context.set_rgb_fill_color(
+        r.clamp(0.0, 1.0),
+        g.clamp(0.0, 1.0),
+        b.clamp(0.0, 1.0),
+        alpha.clamp(0.0, 1.0),
+    );
+    context.fill_path();
+}
+
+/// Nối `from` -> `to` thành các điểm cách nhau ~4 px để dải sáng không bị đứt.
+fn push_trail_segment(trail: &mut Vec<TrailPoint>, from: (f64, f64), to: (f64, f64)) {
+    const POINT_SPACING: f64 = 4.0;
+    const MAX_POINTS_PER_SEGMENT: usize = 48;
+
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let distance = (dx * dx + dy * dy).sqrt();
+    if distance < 0.3 {
+        trail.push(TrailPoint {
+            x: to.0,
+            y: to.1,
+            life: 1.0,
+        });
+        return;
+    }
+
+    let steps = ((distance / POINT_SPACING).ceil() as usize).clamp(1, MAX_POINTS_PER_SEGMENT);
+    for step in 1..=steps {
+        let t = step as f64 / steps as f64;
+        trail.push(TrailPoint {
+            x: from.0 + dx * t,
+            y: from.1 + dy * t,
+            life: 1.0,
+        });
+    }
+}
+
+/// Mô phỏng một frame (gọi từ timer trên main thread, mỗi frame đúng một lần).
+fn tick() {
+    let now = Instant::now();
+    let mut scene = match get_scene().lock() {
+        Ok(scene) => scene,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+
+    let dt = scene
+        .last_frame
+        .map(|last| (now - last).as_secs_f64())
+        .unwrap_or(1.0 / 60.0)
+        .clamp(0.001, 0.05);
+    scene.last_frame = Some(now);
+
+    let f = dt * 60.0;
+    let damping = 0.985_f64.powf(f);
+
+    scene.particles.retain_mut(|p| {
+        p.x += p.vx * f;
+        p.y += p.vy * f;
+        p.vy -= p.gravity * f;
+        p.vx *= damping;
+        p.vy *= damping;
+        p.life -= p.decay * f;
+        p.twinkle_phase += p.twinkle_speed * f;
+        p.life > 0.0
+    });
+
+    if EFFECT.load(Ordering::Relaxed) != EFFECT_NEON {
+        scene.trail.clear();
+        scene.head_init = false;
+        scene.idle_secs = 0.0;
+        return;
+    }
+
+    // Con trỏ bị ẩn (ví dụ đang xem video fullscreen) -> ẩn luôn hiệu ứng
+    // CGCursorIsVisible() là một lời gọi IPC sang WindowServer: gọi mỗi frame tốn
+    // ~40% CPU. Kiểm tra ~6 lần/giây là đủ để ẩn/hiện theo con trỏ.
+    static VIS_FRAME: AtomicUsize = AtomicUsize::new(0);
+    let vis_frame = VIS_FRAME.fetch_add(1, Ordering::Relaxed);
+    if vis_frame % 10 == 0 {
+        let visible = unsafe { CGCursorIsVisible() };
+        CURSOR_VISIBLE.store(visible, Ordering::Relaxed);
+    }
+
+    if !CURSOR_VISIBLE.load(Ordering::Relaxed) {
+        scene.trail.clear();
+        scene.head_init = false;
+        scene.idle_secs = 0.0;
+        return;
+    }
+
+    let cursor: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
+    let cursor = (cursor.x, cursor.y);
+
+    // Mẫu vị trí thật do CGEventTap ghi lại (mỗi event chuột là một mẫu), nên dải
+    // sáng bám đúng đường đi kể cả khi chuột flick rất nhanh.
+    let mut samples = take_mouse_samples();
+    samples.retain(|(_, _, at)| now.duration_since(*at).as_secs_f64() < 0.5);
+
+    if !scene.head_init {
+        scene.head = cursor;
+        scene.head_init = true;
+        samples.clear();
+    }
+
+    if samples.is_empty() {
+        scene.idle_secs += dt;
+    } else {
+        scene.idle_secs = 0.0;
+    }
+
+    scene.hue_phase = (scene.hue_phase + dt * 0.55) % 1.0;
+
+    for point in scene.trail.iter_mut() {
+        point.life -= dt * 1.6;
+    }
+    scene.trail.retain(|point| point.life > 0.0);
+
+    const MAX_TRAIL_POINTS: usize = 320;
+    let mut previous = scene.trail.last().map(|p| (p.x, p.y)).unwrap_or(scene.head);
+
+    if samples.is_empty() {
+        // Chuột đứng yên: giữ một điểm tại con trỏ
+        push_trail_segment(&mut scene.trail, previous, cursor);
+        previous = cursor;
+    } else {
+        for (x, y, _) in samples {
+            push_trail_segment(&mut scene.trail, previous, (x, y));
+            previous = (x, y);
+        }
+    }
+    scene.head = previous;
+
+    if scene.trail.len() > MAX_TRAIL_POINTS {
+        let excess = scene.trail.len() - MAX_TRAIL_POINTS;
+        scene.trail.drain(0..excess);
+    }
+
+    // Đứng yên -> lấp lánh neon ngay tại con trỏ
+    if scene.idle_secs > 0.12 && scene.particles.len() < 500 {
+        let mut rng = rand::thread_rng();
+        if rng.gen::<f64>() < 0.75 {
+            let angle = rng.gen_range(0.0..TAU);
+            let speed = 0.15 + rng.gen::<f64>() * 0.7;
+            let (sr, sg, sb) = neon_color(scene.hue_phase + rng.gen::<f64>() * 0.15);
+            scene.particles.push(Particle {
+                x: cursor.0 + angle.cos() * 2.0,
+                y: cursor.1 + angle.sin() * 2.0,
+                vx: angle.cos() * speed,
+                vy: angle.sin() * speed,
+                life: 1.0,
+                decay: 0.022 + rng.gen::<f64>() * 0.02,
+                r: sr,
+                g: sg,
+                b: sb,
+                size: 1.0 + rng.gen::<f64>() * 1.6,
+                gravity: 0.01,
+                twinkle_phase: rng.gen_range(0.0..TAU),
+                twinkle_speed: 0.5 + rng.gen::<f64>() * 1.0,
+            });
+        }
+    }
+}
+
+fn current_cg_context_ref() -> Option<CGContextRef> {
+    unsafe {
+        let graphics: id = msg_send![class!(NSGraphicsContext), currentContext];
+        if graphics == nil {
+            return None;
+        }
+        let context: CGContextRef = msg_send![graphics, CGContext];
+        if context.is_null() {
+            None
+        } else {
+            Some(context)
+        }
+    }
+}
+
+/// CGContext hiện tại — vẽ thẳng bằng CoreGraphics nhanh hơn nhiều so với tạo
+/// NSColor/NSBezierPath cho từng hình (mỗi frame có hàng trăm hình).
+fn current_cg_context() -> Option<CGContext> {
+    unsafe {
+        let graphics: id = msg_send![class!(NSGraphicsContext), currentContext];
+        if graphics == nil {
+            return None;
+        }
+        let context: CGContextRef = msg_send![graphics, CGContext];
+        if context.is_null() {
+            None
+        } else {
+            Some(CGContext::from_existing_context_ptr(context))
+        }
+    }
+}
+
+fn fill_oval(cx: f64, cy: f64, radius: f64, r: f64, g: f64, b: f64, alpha: f64) {
     if radius <= 0.2 || alpha <= 0.002 {
         return;
     }
-    let color: id = msg_send![
-        class!(NSColor),
-        colorWithCalibratedRed: r.clamp(0.0, 1.0)
-        green: g.clamp(0.0, 1.0)
-        blue: b.clamp(0.0, 1.0)
-        alpha: alpha.clamp(0.0, 1.0)
-    ];
-    let _: () = msg_send![color, setFill];
-
-    let rect = NSRect::new(
-        NSPoint::new(cx - radius, cy - radius),
-        NSSize::new(radius * 2.0, radius * 2.0),
+    let Some(context) = current_cg_context() else {
+        return;
+    };
+    context.set_rgb_fill_color(
+        r.clamp(0.0, 1.0),
+        g.clamp(0.0, 1.0),
+        b.clamp(0.0, 1.0),
+        alpha.clamp(0.0, 1.0),
     );
-    let path: id = msg_send![class!(NSBezierPath), bezierPathWithOvalInRect: rect];
-    let _: () = msg_send![path, fill];
+    let rect = CGRect::new(
+        &CGPoint::new(cx - radius, cy - radius),
+        &CGSize::new(radius * 2.0, radius * 2.0),
+    );
+    context.fill_ellipse_in_rect(rect);
 }
 
 extern "C" fn draw_rect(this: &Object, _sel: Sel, _rect: NSRect) {
@@ -681,33 +1076,20 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, _rect: NSRect) {
         let max_x = frame.size.width;
         let max_y = frame.size.height;
 
-        let mut scene = match get_scene().lock() {
+        // Cửa sổ trong suốt: tự xoá sạch vùng vẽ trước khi vẽ frame mới. Không có
+        // bước này, pixel của frame trước (nhất là khi rê chuột rất nhanh) sẽ nằm
+        // lại trên màn hình thành "vệt dính" cho tới khi có gì đó vẽ đè lên.
+        if let Some(context) = current_cg_context_ref() {
+            CGContextClearRect(
+                context,
+                CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(max_x, max_y)),
+            );
+        }
+
+        let scene = match get_scene().lock() {
             Ok(scene) => scene,
             Err(poisoned) => poisoned.into_inner(),
         };
-
-        // Bước thời gian thật -> chuyển động mượt, không phụ thuộc tốc độ timer
-        let now = Instant::now();
-        let dt = scene
-            .last_frame
-            .map(|last| (now - last).as_secs_f64())
-            .unwrap_or(1.0 / 60.0)
-            .clamp(0.001, 0.05);
-        scene.last_frame = Some(now);
-
-        let f = dt * 60.0;
-        let damping = 0.985_f64.powf(f);
-
-        scene.particles.retain_mut(|p| {
-            p.x += p.vx * f;
-            p.y += p.vy * f;
-            p.vy -= p.gravity * f;
-            p.vx *= damping;
-            p.vy *= damping;
-            p.life -= p.decay * f;
-            p.twinkle_phase += p.twinkle_speed * f;
-            p.life > 0.0
-        });
 
         for p in scene.particles.iter() {
             let x = p.x - offset_x;
@@ -732,6 +1114,42 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, _rect: NSRect) {
             let hot_g = p.g + (1.0 - p.g) * 0.7;
             let hot_b = p.b + (1.0 - p.b) * 0.7;
             fill_oval(x, y, core * 0.85, hot_r, hot_g, hot_b, alpha * 0.95);
+        }
+
+        // Dải sáng neon bám theo con trỏ
+        if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON
+            && CURSOR_VISIBLE.load(Ordering::Relaxed)
+            && scene.trail.len() > 2
+        {
+            let count = scene.trail.len();
+            let mut points: Vec<(f64, f64)> = Vec::with_capacity(count);
+            for point in scene.trail.iter() {
+                points.push((point.x - offset_x, point.y - offset_y));
+            }
+
+            // Làm mượt nhẹ đường đi để hai biên của dải không bị gợn
+            let mut smooth: Vec<(f64, f64)> = Vec::with_capacity(count);
+            for i in 0..count {
+                let a = points[i.saturating_sub(1)];
+                let b = points[i];
+                let c = points[(i + 1).min(count - 1)];
+                smooth.push(((a.0 + 2.0 * b.0 + c.0) / 4.0, (a.1 + 2.0 * b.1 + c.1) / 4.0));
+            }
+
+            let (r, g, b) = neon_color(scene.hue_phase);
+            // Nhiều lớp, mỗi lớp là MỘT path kín: quầng -> thân -> ruột trắng
+            fill_ribbon(&smooth, 48.0, r, g, b, 0.07);
+            fill_ribbon(&smooth, 30.0, r, g, b, 0.14);
+            fill_ribbon(&smooth, 20.0, r, g, b, 0.78);
+            fill_ribbon(&smooth, 8.0, 1.0, 1.0, 1.0, 0.55);
+
+            // Đầu dải sáng: quầng neon nhấp nháy tại con trỏ
+            if let Some((hx, hy)) = smooth.last().copied() {
+                let pulse = 0.55 + 0.45 * ((scene.hue_phase * TAU * 3.0).sin() * 0.5 + 0.5);
+                fill_oval(hx, hy, 30.0, r, g, b, 0.05 * pulse);
+                fill_oval(hx, hy, 15.0, r, g, b, 0.12 * pulse);
+                fill_oval(hx, hy, 7.0, 1.0, 1.0, 1.0, 0.6 * pulse);
+            }
         }
     }
 }
@@ -764,7 +1182,8 @@ fn main() {
 
         // Mỗi màn hình (MacBook, màn hình ngoài qua DP/HDMI...) một cửa sổ overlay riêng
         let view_class = register_view_class();
-        let mut views: Vec<usize> = Vec::new();
+        // (view, offset_x, offset_y) của từng cửa sổ overlay
+        let mut views: Vec<(usize, f64, f64)> = Vec::new();
         let screens: id = msg_send![class!(NSScreen), screens];
         let screen_count: usize = msg_send![screens, count];
         for index in 0..screen_count {
@@ -793,21 +1212,23 @@ fn main() {
             ];
             window.setContentView_(view);
             window.makeKeyAndOrderFront_(nil);
-            views.push(view as usize);
+            views.push((view as usize, frame.origin.x, frame.origin.y));
         }
 
         eprintln!("Overlay đã tạo cho {} màn hình.", views.len());
 
-        // Một quả pháo chào ngay khi mở app: thấy được hiệu ứng kể cả khi
-        // chưa cấp quyền Trợ năng.
-        spawn_firework(
-            main_display_bounds.size.width / 2.0,
-            screen_height / 2.0,
-        );
-
-        // Tiếng click, panel settings và icon trên menu bar
+        // Tiếng click, hiệu ứng, panel settings và icon trên menu bar
         load_sound_preference();
+        load_effect_preference();
         load_sounds();
+
+        // Quả pháo chào ngay khi mở app (chỉ ở chế độ Fireworks)
+        if EFFECT.load(Ordering::Relaxed) == EFFECT_FIREWORKS {
+            spawn_firework(
+                main_display_bounds.size.width / 2.0,
+                screen_height / 2.0,
+            );
+        }
         let controller: id = msg_send![register_controller_class(), new];
         let _ = SETTINGS_WINDOW.set(build_settings_window(controller) as usize);
         build_status_item(controller);
@@ -818,13 +1239,34 @@ fn main() {
                 CGEventTapLocation::HID,
                 CGEventTapPlacement::HeadInsertEventTap,
                 CGEventTapOptions::ListenOnly,
-                vec![CGEventType::LeftMouseDown],
-                move |_proxy, _etype, event| {
-                    let loc = event.location();
-                    let cocoa_y = screen_height - loc.y;
-                    spawn_firework(loc.x, cocoa_y);
-                    // Phát tiếng ở main thread (trong timer) để không đụng AppKit từ thread này
-                    SOUND_PENDING.store(true, Ordering::Relaxed);
+                vec![
+                    CGEventType::LeftMouseDown,
+                    CGEventType::MouseMoved,
+                    CGEventType::LeftMouseDragged,
+                ],
+                move |_proxy, etype, event| {
+                    match etype {
+                        CGEventType::MouseMoved | CGEventType::LeftMouseDragged => {
+                            // Ghi mẫu vị trí thật để dải neon bám đúng đường đi
+                            if EFFECT.load(Ordering::Relaxed) == EFFECT_NEON {
+                                let loc = event.location();
+                                push_mouse_sample(
+                                    loc.x,
+                                    screen_height - loc.y,
+                                    Instant::now(),
+                                );
+                            }
+                        }
+                        _ => {
+                            let loc = event.location();
+                            let cocoa_y = screen_height - loc.y;
+                            if EFFECT.load(Ordering::Relaxed) == EFFECT_FIREWORKS {
+                                spawn_firework(loc.x, cocoa_y);
+                            }
+                            // Phát tiếng ở main thread (trong timer) để không đụng AppKit từ thread này
+                            SOUND_PENDING.store(true, Ordering::Relaxed);
+                        }
+                    }
                     None
                 },
             );
@@ -858,7 +1300,22 @@ fn main() {
             if SOUND_PENDING.swap(false, Ordering::Relaxed) {
                 play_click_sound();
             }
-            for view in &views {
+            tick();
+
+            let idle = match get_scene().lock() {
+                Ok(scene) => scene.idle_secs > 0.12,
+                Err(poisoned) => poisoned.into_inner().idle_secs > 0.12,
+            };
+
+            // Chuột đứng yên thì chỉ cần 30 fps cho các đốm lấp lánh -> nhẹ CPU
+            static PARITY: AtomicUsize = AtomicUsize::new(0);
+            if idle && PARITY.fetch_add(1, Ordering::Relaxed) % 2 == 1 {
+                return;
+            }
+
+            // Vẽ lại toàn bộ overlay. Invalidate từng phần trên cửa sổ trong suốt
+            // sẽ để lại vệt cũ khi trail dài/đổi hướng đột ngột.
+            for (view, _, _) in &views {
                 let v = *view as id;
                 let _: () = msg_send![v, setNeedsDisplay: YES];
             }
