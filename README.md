@@ -1,8 +1,7 @@
 # Fireworks-cursor
 
 <p align="center">
-<video src="demo/demo.mp4" controls style="max-width: 730px;">
-</video>
+  <img src="demo/demo.gif" alt="Demo App" width="500">
 </p>
 
 ## Âm thanh
