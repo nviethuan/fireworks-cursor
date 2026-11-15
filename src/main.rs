@@ -26,6 +26,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 
+mod click;
+
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
@@ -38,6 +40,8 @@ extern "C" {
     fn CGRequestListenEventAccess() -> bool;
     fn CGCursorIsVisible() -> bool;
     fn CGContextClearRect(context: CGContextRef, rect: CGRect);
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
     /// Bật lại event tap sau khi macOS tự ngắt nó (callback chậm quá thời gian cho phép).
     fn CGEventTapEnable(tap: *mut std::ffi::c_void, enable: bool);
 }
@@ -113,8 +117,14 @@ fn accessibility_granted() -> bool {
 
 static SOUND_ENABLED: AtomicBool = AtomicBool::new(true);
 static SOUND_PENDING: AtomicBool = AtomicBool::new(false);
-/// Pool phát cho từng loại âm thanh: mỗi loại có 4 bản để bấm liên tiếp không cắt nhau
-static SOUND_POOLS: OnceLock<Vec<Vec<usize>>> = OnceLock::new();
+/// Click do event tap (chạy ở thread riêng) ghi lại, main thread sẽ vẽ hiệu ứng.
+/// AppKit/Core Image không được dùng từ thread của event tap.
+static PENDING_CLICKS: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
+/// Pool phát theo từng loại âm thanh, **nạp khi cần**: mỗi loại có 4 bản NSSound
+/// để bấm liên tiếp không cắt nhau. `None` = loại đó chưa được nạp.
+static SOUND_POOLS: Mutex<Vec<Option<Vec<usize>>>> = Mutex::new(Vec::new());
+/// UID loa trong của máy (tính một lần, dùng lại cho mọi NSSound)
+static SOUND_DEVICE_UID: OnceLock<Option<usize>> = OnceLock::new();
 /// Loại âm thanh đang chọn (chỉ số trong SOUND_KINDS)
 static SOUND_KIND: AtomicU8 = AtomicU8::new(0);
 
@@ -174,8 +184,22 @@ static SOUND_VOLUME_BITS: AtomicU32 = AtomicU32::new(0.45f32.to_bits());
 
 // ---------- Hiệu ứng ----------
 
-/// Hai hiệu ứng bật/tắt độc lập nhau, có thể chạy cùng lúc.
-static FIREWORKS_ON: AtomicBool = AtomicBool::new(true);
+/// Hiệu ứng khi click: pháo hoa, thấu kính nước, hoặc tắt hẳn (chọn một)
+const CLICK_FIREWORKS: u8 = 0;
+const CLICK_OFF: u8 = 2;
+/// Giữ giá trị 3 như bản trước để `defaults` đã lưu không bị đổi nghĩa.
+const CLICK_METAL: u8 = 3;
+
+/// Các mục của popup "Click effects": (giá trị lưu, tên hiển thị).
+/// Giá trị giữ nguyên để không lệch với dữ liệu đã lưu (0 = fireworks, 2 = off,
+/// 3 = metal; 1 là "ripple" đã bỏ nên giờ rơi về fireworks).
+const CLICK_MENU: [(u8, &str); 3] = [
+    (CLICK_FIREWORKS, "Fireworks"),
+    (CLICK_METAL, "Metal warp"),
+    (CLICK_OFF, "Off"),
+];
+static CLICK_EFFECT: AtomicU8 = AtomicU8::new(CLICK_FIREWORKS);
+/// Neon trail bật/tắt độc lập, có thể chạy cùng hiệu ứng click
 static NEON_ON: AtomicBool = AtomicBool::new(false);
 
 // ---------- Skin của dải neon ----------
@@ -207,6 +231,13 @@ const MAX_MOUSE_SAMPLES: usize = 512;
 // ---------- Menu bar + panel settings ----------
 
 static SETTINGS_WINDOW: OnceLock<usize> = OnceLock::new();
+/// (window number, frame) của các cửa sổ overlay — dùng để chụp màn hình nằm dưới
+/// đúng cửa sổ overlay đang chứa điểm click.
+static OVERLAY_WINDOWS: OnceLock<Vec<(u32, CGRect)>> = OnceLock::new();
+pub(crate) fn overlay_windows() -> Option<&'static [(u32, CGRect)]> {
+    OVERLAY_WINDOWS.get().map(|v| v.as_slice())
+}
+
 static STATUS_ITEM: OnceLock<usize> = OnceLock::new();
 static VOLUME_LABEL: OnceLock<usize> = OnceLock::new();
 static VOLUME_TITLE: OnceLock<usize> = OnceLock::new();
@@ -217,7 +248,7 @@ static SOUND_CHECKBOX: OnceLock<usize> = OnceLock::new();
 static SKIN_LABEL: OnceLock<usize> = OnceLock::new();
 static SKIN_POPUP: OnceLock<usize> = OnceLock::new();
 
-fn nsstring(s: &str) -> id {
+pub(crate) fn nsstring(s: &str) -> id {
     unsafe { NSString::alloc(nil).init_str(s) }
 }
 
@@ -254,15 +285,36 @@ fn set_sound_volume(value: f32) -> f32 {
 fn load_effect_preferences() {
     unsafe {
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
-        let fireworks_key = nsstring("FireworksEnabled");
-        let neon_key = nsstring("NeonEnabled");
-        let fireworks: id = msg_send![defaults, objectForKey: fireworks_key];
-        let neon: id = msg_send![defaults, objectForKey: neon_key];
 
-        if fireworks != nil || neon != nil {
-            let fireworks_on: bool = msg_send![defaults, boolForKey: fireworks_key];
+        let click_key = nsstring("ClickEffect");
+        let click: id = msg_send![defaults, objectForKey: click_key];
+        if click != nil {
+            let value: i64 = msg_send![defaults, integerForKey: click_key];
+            let effect = match value {
+                2 => CLICK_OFF,
+                3 => CLICK_METAL,
+                _ => CLICK_FIREWORKS,
+            };
+            CLICK_EFFECT.store(effect, Ordering::Relaxed);
+        } else {
+            // Bản cũ dùng checkbox "Fireworks on click" -> FireworksEnabled
+            let legacy_key = nsstring("FireworksEnabled");
+            let legacy: id = msg_send![defaults, objectForKey: legacy_key];
+            if legacy != nil {
+                let enabled: bool = msg_send![defaults, boolForKey: legacy_key];
+                let effect = if enabled {
+                    CLICK_FIREWORKS
+                } else {
+                    CLICK_OFF
+                };
+                CLICK_EFFECT.store(effect, Ordering::Relaxed);
+            }
+        }
+
+        let neon_key = nsstring("NeonEnabled");
+        let neon: id = msg_send![defaults, objectForKey: neon_key];
+        if neon != nil {
             let neon_on: bool = msg_send![defaults, boolForKey: neon_key];
-            FIREWORKS_ON.store(fireworks_on, Ordering::Relaxed);
             NEON_ON.store(neon_on, Ordering::Relaxed);
             return;
         }
@@ -272,14 +324,22 @@ fn load_effect_preferences() {
         let legacy: id = msg_send![defaults, objectForKey: legacy_key];
         if legacy != nil {
             let value: i64 = msg_send![defaults, integerForKey: legacy_key];
-            FIREWORKS_ON.store(value == 0, Ordering::Relaxed);
             NEON_ON.store(value == 1, Ordering::Relaxed);
         }
     }
 }
 
-fn fireworks_on() -> bool {
-    FIREWORKS_ON.load(Ordering::Relaxed)
+fn click_effect() -> u8 {
+    CLICK_EFFECT.load(Ordering::Relaxed)
+}
+
+/// Vị trí của hiệu ứng đang chọn trong popup (xem `CLICK_MENU`).
+fn click_effect_index() -> i64 {
+    let current = click_effect();
+    CLICK_MENU
+        .iter()
+        .position(|(value, _)| *value == current)
+        .unwrap_or(0) as i64
 }
 
 fn neon_on() -> bool {
@@ -519,60 +579,87 @@ unsafe fn builtin_output_uid() -> Option<id> {
 }
 
 /// Nạp sẵn vài bản sao để click liên tiếp vẫn phát, không cắt tiếng của nhau.
-fn load_sounds() {
-    let mut pools: Vec<Vec<usize>> = Vec::with_capacity(SOUND_KINDS.len());
-    unsafe {
-        let bundle: id = msg_send![class!(NSBundle), mainBundle];
+/// UID loa trong, tính một lần rồi dùng lại (tránh hỏi CoreAudio mỗi lần nạp pool).
+fn sound_device_uid() -> Option<usize> {
+    *SOUND_DEVICE_UID.get_or_init(|| unsafe {
         // Ghim phát ra loa trong của máy. Nếu để NSSound tự chọn, nó đi theo đường
         // "alert sound" và có thể ra cả Bluetooth/AirPlay — mỗi lần đánh thức thiết bị
         // ngoài là một lần macOS hiện HUD âm lượng.
-        let device_uid = match builtin_output_uid() {
+        let uid = match builtin_output_uid() {
             Some(uid) => Some(uid),
             None => {
                 eprintln!("Không tìm thấy loa trong của máy: phát ra thiết bị ra mặc định.");
                 default_output_device_uid()
             }
         };
-        if device_uid.is_none() {
+        if uid.is_none() {
             eprintln!("Không đọc được thiết bị âm thanh: dùng đường phát mặc định.");
         }
+        uid.map(|uid| uid as usize)
+    })
+}
 
-        for name in SOUND_KINDS {
-            let path: id = msg_send![
-                bundle,
-                pathForResource: nsstring(name)
-                ofType: nsstring("wav")
-            ];
-            let mut pool: Vec<usize> = Vec::with_capacity(4);
-            if path == nil {
-                eprintln!("Không thấy {name}.wav trong bundle.");
-            } else {
-                for _ in 0..4 {
-                    let sound: id = msg_send![class!(NSSound), alloc];
-                    let sound: id = msg_send![sound, initWithContentsOfFile: path byReference: YES];
-                    if sound != nil {
-                        let _: () = msg_send![sound, setVolume: sound_volume()];
-                        if let Some(uid) = device_uid {
-                            let _: () = msg_send![sound, setPlaybackDeviceIdentifier: uid];
-                        }
-                        pool.push(sound as usize);
-                    }
-                }
+/// Nạp 4 bản NSSound cho một loại âm thanh.
+unsafe fn load_sound_pool(kind: usize) -> Option<Vec<usize>> {
+    let name = SOUND_KINDS[kind];
+    let bundle: id = msg_send![class!(NSBundle), mainBundle];
+    let path: id = msg_send![
+        bundle,
+        pathForResource: nsstring(name)
+        ofType: nsstring("wav")
+    ];
+    if path == nil {
+        eprintln!("Không thấy {name}.wav trong bundle.");
+        return None;
+    }
+
+    let device_uid = sound_device_uid();
+    let mut pool = Vec::with_capacity(4);
+    for _ in 0..4 {
+        let sound: id = msg_send![class!(NSSound), alloc];
+        let sound: id = msg_send![sound, initWithContentsOfFile: path byReference: YES];
+        if sound != nil {
+            let _: () = msg_send![sound, setVolume: sound_volume()];
+            if let Some(uid) = device_uid {
+                let _: () = msg_send![sound, setPlaybackDeviceIdentifier: uid as id];
             }
-            pools.push(pool);
+            pool.push(sound as usize);
         }
     }
-    SOUND_POOLS.get_or_init(|| pools);
+    Some(pool)
+}
+
+/// Bảo đảm pool của loại `kind` đã nạp (gọi lần đầu khi cần phát).
+fn ensure_sound_pool(kind: usize) {
+    let mut pools = match SOUND_POOLS.lock() {
+        Ok(pools) => pools,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if pools.len() < SOUND_KINDS.len() {
+        pools.resize(SOUND_KINDS.len(), None);
+    }
+    if pools[kind].is_none() {
+        pools[kind] = unsafe { load_sound_pool(kind) };
+    }
+}
+
+/// Chỉ nạp sẵn pool của loại đang chọn (4 NSSound) — không nạp cả 22 loại lúc khởi động.
+fn preload_sound_kind() {
+    ensure_sound_pool(SOUND_KIND.load(Ordering::Relaxed) as usize);
 }
 
 fn play_click_sound() {
     if !sound_enabled() {
         return;
     }
-    let Some(pools) = SOUND_POOLS.get() else {
-        return;
+    let kind = SOUND_KIND.load(Ordering::Relaxed) as usize;
+    ensure_sound_pool(kind);
+
+    let pools = match SOUND_POOLS.lock() {
+        Ok(pools) => pools,
+        Err(poisoned) => poisoned.into_inner(),
     };
-    let Some(pool) = pools.get(SOUND_KIND.load(Ordering::Relaxed) as usize) else {
+    let Some(pool) = pools.get(kind).and_then(|pool| pool.as_ref()) else {
         return;
     };
     if pool.is_empty() {
@@ -625,11 +712,10 @@ extern "C" fn change_volume(_this: &Object, _sel: Sel, sender: id) {
     unsafe {
         let value: f64 = msg_send![sender, doubleValue];
         let volume = set_sound_volume(value as f32);
-        if let Some(pools) = SOUND_POOLS.get() {
-            for pool in pools {
-                for sound in pool {
-                    let _: () = msg_send![*sound as id, setVolume: volume];
-                }
+        // Chỉ chỉnh những pool đang có (các loại chưa dùng thì chưa nạp)
+        if let Ok(pools) = SOUND_POOLS.lock() {
+            for sound in pools.iter().flatten().flatten() {
+                let _: () = msg_send![*sound as id, setVolume: volume];
             }
         }
         if let Some(label) = VOLUME_LABEL.get() {
@@ -643,23 +729,25 @@ extern "C" fn change_volume(_this: &Object, _sel: Sel, sender: id) {
     }
 }
 
-extern "C" fn toggle_fireworks(_this: &Object, _sel: Sel, sender: id) {
+extern "C" fn change_click_effect(_this: &Object, _sel: Sel, sender: id) {
     unsafe {
-        let state: i64 = msg_send![sender, state];
-        let enabled = state != 0;
-        FIREWORKS_ON.store(enabled, Ordering::Relaxed);
+        let index: i64 = msg_send![sender, indexOfSelectedItem];
+        let effect = CLICK_MENU
+            .get(index.max(0) as usize)
+            .map(|(value, _)| *value)
+            .unwrap_or(CLICK_FIREWORKS);
+        CLICK_EFFECT.store(effect, Ordering::Relaxed);
 
-        // Tắt pháo hoa thì dọn những quả đang bay cho khỏi "dính" lại trên màn hình
-        if !enabled {
-            if let Ok(mut scene) = get_scene().lock() {
-                scene.particles.clear();
-                update_dirty_bounds(&mut scene);
-            }
+        // Đổi hiệu ứng (hoặc tắt hẳn) thì dọn cảnh cũ cho khỏi "dính" lại
+        click::clear();
+        if let Ok(mut scene) = get_scene().lock() {
+            scene.particles.clear();
+            update_dirty_bounds(&mut scene);
         }
 
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
-        let key = nsstring("FireworksEnabled");
-        let _: () = msg_send![defaults, setBool: enabled forKey: key];
+        let key = nsstring("ClickEffect");
+        let _: () = msg_send![defaults, setInteger: effect as i64 forKey: key];
     }
 }
 
@@ -755,8 +843,8 @@ fn register_controller_class() -> *const Class {
             change_volume as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
-            sel!(toggleFireworks:),
-            toggle_fireworks as extern "C" fn(&Object, Sel, id),
+            sel!(changeClickEffect:),
+            change_click_effect as extern "C" fn(&Object, Sel, id),
         );
         decl.add_method(
             sel!(toggleNeon:),
@@ -838,17 +926,24 @@ unsafe fn build_settings_window(controller: id) -> id {
     let _ = SKIN_LABEL.set(skin_label as usize);
     let _ = SKIN_POPUP.set(skin_popup as usize);
 
-    // ================= Fireworks (độc lập) =================
-    let fireworks_box: id = msg_send![
-        class!(NSButton),
-        checkboxWithTitle: nsstring("Fireworks on click")
-        target: controller
-        action: sel!(toggleFireworks:)
+    // ================= Click effects: pháo hoa hay sóng nước =================
+    let click_label: id = msg_send![class!(NSTextField), labelWithString: nsstring("Click effects")];
+    let _: () = msg_send![click_label, setFrame: NSRect::new(NSPoint::new(36.0, 204.0), NSSize::new(90.0, 18.0))];
+    let _: () = msg_send![content, addSubview: click_label];
+
+    let click_popup: id = msg_send![class!(NSPopUpButton), alloc];
+    let click_popup: id = msg_send![
+        click_popup,
+        initWithFrame: NSRect::new(NSPoint::new(130.0, 198.0), NSSize::new(170.0, 26.0))
+        pullsDown: NO
     ];
-    let state: i64 = if fireworks_on() { 1 } else { 0 };
-    let _: () = msg_send![fireworks_box, setState: state];
-    let _: () = msg_send![fireworks_box, setFrame: NSRect::new(NSPoint::new(20.0, 202.0), NSSize::new(280.0, 22.0))];
-    let _: () = msg_send![content, addSubview: fireworks_box];
+    for (_, title) in CLICK_MENU.iter() {
+        let _: () = msg_send![click_popup, addItemWithTitle: nsstring(title)];
+    }
+    let _: () = msg_send![click_popup, selectItemAtIndex: click_effect_index()];
+    let _: () = msg_send![click_popup, setTarget: controller];
+    let _: () = msg_send![click_popup, setAction: sel!(changeClickEffect:)];
+    let _: () = msg_send![content, addSubview: click_popup];
 
     // ================= Sound (ngang hàng với Fireworks) =================
     let checkbox: id = msg_send![
@@ -997,12 +1092,7 @@ fn take_mouse_samples() -> Vec<MouseSample> {
     }
 }
 
-struct TrailPoint {
-    x: f64,
-    y: f64,
-    life: f64,
-}
-
+/// Trạng thái vẽ của overlay: hạt pháo hoa, dải neon và vùng cần vẽ lại.
 struct Scene {
     particles: Vec<Particle>,
     trail: Vec<TrailPoint>,
@@ -1042,10 +1132,30 @@ fn get_scene() -> &'static Mutex<Scene> {
             paint_history: Vec::new(),
             dirty_bounds: None,
             was_moving: false,
-            last_cursor: None,
             full_refresh: false,
+            last_cursor: None,
         })
     })
+}
+
+fn screen_capture_granted() -> bool {
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+fn request_screen_capture_access() {
+    unsafe {
+        let _ = CGRequestScreenCaptureAccess();
+    }
+    eprintln!(
+        "Hiệu ứng cần quyền Screen Recording để phản chiếu hình phía sau:\n  \
+         System Settings > Privacy & Security > Screen Recording > bật Mac Fireworks, rồi mở lại app."
+    );
+}
+
+struct TrailPoint {
+    x: f64,
+    y: f64,
+    life: f64,
 }
 
 fn spawn_firework(x: f64, y: f64) {
@@ -1248,6 +1358,13 @@ fn update_dirty_bounds(scene: &mut Scene) {
     // Hạt lấp lánh: quầng ngoài cùng là core * 4.4
     for particle in scene.particles.iter() {
         include(particle.x, particle.y, particle.size * 4.4 + 6.0);
+    }
+    // Vùng của các hiệu ứng click (sóng nước, warp, hybrid, ...)
+    if let Some((x0, y0, x1, y1)) = click::bounds() {
+        let cx = (x0 + x1) / 2.0;
+        let cy = (y0 + y1) / 2.0;
+        let radius = ((x1 - x0).max(y1 - y0) / 2.0) + 2.0;
+        include(cx, cy, radius);
     }
     if neon_on() && !EFFECT_HIDDEN.load(Ordering::Relaxed) {
         // Dải sáng: nửa bề rộng quầng lớn nhất (48/2) + làm mượt + khử răng cưa,
@@ -1716,6 +1833,19 @@ unsafe fn draw_aurora_trail(points: &[(f64, f64)], phase: f64) {
 /// Mô phỏng một frame (gọi từ timer trên main thread, mỗi frame đúng một lần).
 fn tick() {
     let now = Instant::now();
+
+    // Click đến từ event tap: dựng hiệu ứng ở main thread (AppKit/CI an toàn thread)
+    let clicks: Vec<(f64, f64)> = match PENDING_CLICKS.lock() {
+        Ok(mut pending) => std::mem::take(&mut *pending),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    };
+    for (x, y) in clicks {
+        match click_effect() {
+            CLICK_FIREWORKS => spawn_firework(x, y),
+            effect => click::spawn(effect, x, y),
+        }
+    }
+
     let mut scene = match get_scene().lock() {
         Ok(scene) => scene,
         Err(poisoned) => poisoned.into_inner(),
@@ -1741,6 +1871,9 @@ fn tick() {
         p.twinkle_phase += p.twinkle_speed * f;
         p.life > 0.0
     });
+
+    // Tuổi của các hiệu ứng click (sóng nước, warp, bong bóng kính, hybrid)
+    click::update(dt);
 
     if !neon_on() {
         scene.trail.clear();
@@ -1874,7 +2007,7 @@ fn tick() {
     update_dirty_bounds(&mut scene);
 }
 
-fn current_cg_context_ref() -> Option<CGContextRef> {
+pub(crate) fn current_cg_context_ref() -> Option<CGContextRef> {
     unsafe {
         let graphics: id = msg_send![class!(NSGraphicsContext), currentContext];
         if graphics == nil {
@@ -1891,7 +2024,7 @@ fn current_cg_context_ref() -> Option<CGContextRef> {
 
 /// CGContext hiện tại — vẽ thẳng bằng CoreGraphics nhanh hơn nhiều so với tạo
 /// NSColor/NSBezierPath cho từng hình (mỗi frame có hàng trăm hình).
-fn current_cg_context() -> Option<CGContext> {
+pub(crate) fn current_cg_context() -> Option<CGContext> {
     unsafe {
         let graphics: id = msg_send![class!(NSGraphicsContext), currentContext];
         if graphics == nil {
@@ -1906,7 +2039,7 @@ fn current_cg_context() -> Option<CGContext> {
     }
 }
 
-fn fill_oval(cx: f64, cy: f64, radius: f64, r: f64, g: f64, b: f64, alpha: f64) {
+pub(crate) fn fill_oval(cx: f64, cy: f64, radius: f64, r: f64, g: f64, b: f64, alpha: f64) {
     if radius <= 0.2 || alpha <= 0.002 {
         return;
     }
@@ -1924,6 +2057,36 @@ fn fill_oval(cx: f64, cy: f64, radius: f64, r: f64, g: f64, b: f64, alpha: f64) 
         &CGSize::new(radius * 2.0, radius * 2.0),
     );
     context.fill_ellipse_in_rect(rect);
+}
+
+/// Vẽ một vòng tròn (nét) bằng Core Graphics.
+pub(crate) fn stroke_circle(
+    cx: f64,
+    cy: f64,
+    radius: f64,
+    r: f64,
+    g: f64,
+    b: f64,
+    alpha: f64,
+    width: f64,
+) {
+    if radius <= 0.5 || alpha <= 0.002 {
+        return;
+    }
+    let Some(context) = current_cg_context() else {
+        return;
+    };
+    context.set_rgb_stroke_color(
+        r.clamp(0.0, 1.0),
+        g.clamp(0.0, 1.0),
+        b.clamp(0.0, 1.0),
+        alpha.clamp(0.0, 1.0),
+    );
+    context.set_line_width(width);
+    context.stroke_ellipse_in_rect(CGRect::new(
+        &CGPoint::new(cx - radius, cy - radius),
+        &CGSize::new(radius * 2.0, radius * 2.0),
+    ));
 }
 
 extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
@@ -1986,6 +2149,9 @@ extern "C" fn draw_rect(this: &Object, _sel: Sel, dirty_rect: NSRect) {
             let hot_b = p.b + (1.0 - p.b) * 0.7;
             fill_oval(x, y, core * 0.85, hot_r, hot_g, hot_b, alpha * 0.95);
         }
+
+        // Hiệu ứng click (thấu kính nước) tự vẽ phần Core Graphics
+        click::draw(&click::Frame { offset_x, offset_y });
 
         // Dải sáng neon bám theo con trỏ
         if neon_on()
@@ -2067,6 +2233,7 @@ fn main() {
         let view_class = register_view_class();
         // (view, offset_x, offset_y) của từng cửa sổ overlay
         let mut views: Vec<(usize, f64, f64)> = Vec::new();
+        let mut overlay_windows: Vec<(u32, CGRect)> = Vec::new();
         let screens: id = msg_send![class!(NSScreen), screens];
         let screen_count: usize = msg_send![screens, count];
         for index in 0..screen_count {
@@ -2096,7 +2263,15 @@ fn main() {
             window.setContentView_(view);
             window.makeKeyAndOrderFront_(nil);
             views.push((view as usize, frame.origin.x, frame.origin.y));
+
+            let window_frame = CGRect::new(
+                &CGPoint::new(frame.origin.x, frame.origin.y),
+                &CGSize::new(frame.size.width, frame.size.height),
+            );
+            let number: i64 = msg_send![window, windowNumber];
+            overlay_windows.push((number as u32, window_frame));
         }
+        let _ = OVERLAY_WINDOWS.set(overlay_windows);
 
         eprintln!("Overlay đã tạo cho {} màn hình.", views.len());
 
@@ -2105,10 +2280,15 @@ fn main() {
         load_sound_kind_preference();
         load_effect_preferences();
         load_skin_preference();
-        load_sounds();
+        preload_sound_kind();
 
-        // Quả pháo chào ngay khi mở app (nếu pháo hoa đang bật)
-        if fireworks_on() {
+        // Sóng nước thật cần chụp màn hình để bẻ cong ảnh phía sau
+        if click_effect() == CLICK_METAL && !screen_capture_granted() {
+            request_screen_capture_access();
+        }
+
+        // Quả pháo chào ngay khi mở app (chỉ khi đang chọn hiệu ứng pháo hoa)
+        if click_effect() == CLICK_FIREWORKS {
             spawn_firework(
                 main_display_bounds.size.width / 2.0,
                 screen_height / 2.0,
@@ -2154,8 +2334,8 @@ fn main() {
                         _ => {
                             let loc = event.location();
                             let cocoa_y = screen_height - loc.y;
-                            if fireworks_on() {
-                                spawn_firework(loc.x, cocoa_y);
+                            if let Ok(mut clicks) = PENDING_CLICKS.lock() {
+                                clicks.push((loc.x, cocoa_y));
                             }
                             // Phát tiếng ở main thread (trong timer) để không đụng AppKit từ thread này
                             SOUND_PENDING.store(true, Ordering::Relaxed);
