@@ -118,9 +118,57 @@ static SOUND_POOLS: OnceLock<Vec<Vec<usize>>> = OnceLock::new();
 /// Loại âm thanh đang chọn (chỉ số trong SOUND_KINDS)
 static SOUND_KIND: AtomicU8 = AtomicU8::new(0);
 
-/// Tên file trong bundle, thứ tự này cũng là thứ tự trong popup chọn âm thanh
-const SOUND_KINDS: [&str; 5] = ["click", "pop", "chime", "firework", "boom"];
-const SOUND_LABELS: [&str; 5] = ["Click", "Pop", "Chime", "Firework", "Boom"];
+/// Tên file trong bundle, thứ tự này cũng là thứ tự trong popup chọn âm thanh.
+/// 5 mục đầu giữ nguyên thứ tự cũ để cài đặt đã lưu không bị lệch.
+const SOUND_KINDS: [&str; 22] = [
+    "click",
+    "pop",
+    "chime",
+    "firework",
+    "boom",
+    "click-wooden",
+    "button-tap",
+    "bubble-pop",
+    "bubble-pop-2",
+    "rock-on-wood",
+    "squeak-toy",
+    "duck-quack",
+    "menu-beep",
+    "notification",
+    "pluck",
+    "gameboy-pluck",
+    "coin",
+    "coin-received",
+    "drop-coin",
+    "game-bonus",
+    "water-droplet",
+    "firework-2",
+];
+
+const SOUND_LABELS: [&str; 22] = [
+    "Click",
+    "Pop",
+    "Chime",
+    "Firework",
+    "Boom",
+    "Wooden click",
+    "Button tap",
+    "Bubble pop",
+    "Bubble pop 2",
+    "Rock on wood",
+    "Squeak toy",
+    "Duck quack",
+    "Menu beep",
+    "Notification",
+    "Pluck",
+    "Gameboy pluck",
+    "Coin",
+    "Coin received",
+    "Drop coin",
+    "Game bonus",
+    "Water droplet",
+    "Firework 2",
+];
 static SOUND_NEXT: AtomicUsize = AtomicUsize::new(0);
 static SOUND_VOLUME_BITS: AtomicU32 = AtomicU32::new(0.45f32.to_bits());
 
@@ -173,8 +221,7 @@ fn nsstring(s: &str) -> id {
     unsafe { NSString::alloc(nil).init_str(s) }
 }
 
-/// Ẩn/hiện cả cụm cấu hình âm thanh (chọn âm thanh, "play sound", âm lượng).
-/// Cụm này chỉ có ý nghĩa khi pháo hoa click đang bật.
+/// Ẩn/hiện cụm chọn âm thanh + âm lượng: chỉ hiện khi "Play sound on click" bật.
 unsafe fn set_sound_rows_hidden(hidden: bool) {
     let flag = if hidden { YES } else { NO };
     for slot in [
@@ -519,7 +566,6 @@ fn load_sounds() {
 }
 
 fn play_click_sound() {
-    // Cụm cấu hình âm thanh gắn với pháo hoa click: tắt pháo hoa thì không có tiếng
     if !sound_enabled() {
         return;
     }
