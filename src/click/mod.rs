@@ -1,11 +1,13 @@
 //! Hiệu ứng khi click. Mỗi hiệu ứng nằm trong một file riêng để dễ thêm/bỏ:
 //!
 //! * `metal.rs`  — warp ảnh chụp màn hình thành "thấu kính nước" (Core Image)
+//! * `live.rs`   — cùng kiểu thấu kính nhưng lấy frame sống (ScreenCaptureKit)
 //! * `warp.rs`   — phần warp ảnh dùng chung (dựng ảnh + cache)
 //!
 //! Muốn bỏ một hiệu ứng: xoá file tương ứng, xoá `pub mod` ở đây, xoá nhánh
 //! trong `spawn()` và mục trong `CLICK_MENU` ở `main.rs`.
 
+pub mod live;
 pub mod metal;
 pub mod warp;
 
@@ -132,32 +134,35 @@ pub fn capture_patch(cx: f64, cy: f64, half: f64) -> Option<ScreenPatch> {
 
 /// (window number, frame) của cửa sổ overlay chứa điểm (toạ độ Cocoa).
 fn overlay_window_at(x: f64, y: f64) -> Option<(u32, CGRect)> {
-    crate::overlay_windows()?
-        .iter()
+    crate::overlay_windows()
+        .into_iter()
         .find(|(_, frame)| {
             x >= frame.origin.x
                 && x <= frame.origin.x + frame.size.width
                 && y >= frame.origin.y
                 && y <= frame.origin.y + frame.size.height
         })
-        .copied()
 }
 
 /// Gọi khi click, theo hiệu ứng đang chọn (trừ pháo hoa và Off).
 pub fn spawn(effect: u8, x: f64, y: f64) {
     if effect == crate::CLICK_METAL {
         metal::spawn(x, y);
+    } else if effect == crate::CLICK_LIVE {
+        live::spawn(x, y);
     }
 }
 
 /// Cập nhật mọi hiệu ứng (main thread, mỗi frame một lần).
 pub fn update(dt: f64) {
     metal::update(dt);
+    live::update(dt);
 }
 
 /// Vẽ phần Core Graphics của các hiệu ứng (bên trong `drawRect`).
 pub fn draw(frame: &Frame) {
     metal::draw(frame);
+    live::draw(frame);
 }
 
 /// Vùng cần làm sạch/vẽ lại của tất cả hiệu ứng (toạ độ Cocoa toàn cục).
@@ -172,12 +177,14 @@ pub fn bounds() -> Option<Bounds> {
         }
     };
     add(metal::bounds());
+    add(live::bounds());
     union
 }
 
 /// Xoá sạch mọi thứ (khi đổi hiệu ứng hoặc tắt).
 pub fn clear() {
     metal::clear();
+    live::clear();
 }
 
 /// Hình chữ nhật (Cocoa) của một điểm ± bán kính.

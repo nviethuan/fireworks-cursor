@@ -21,7 +21,7 @@ use objc::{class, msg_send, sel, sel_impl};
 use rand::Rng;
 use std::collections::HashSet;
 use std::f64::consts::TAU;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
@@ -189,13 +189,16 @@ const CLICK_FIREWORKS: u8 = 0;
 const CLICK_OFF: u8 = 2;
 /// Giữ giá trị 3 như bản trước để `defaults` đã lưu không bị đổi nghĩa.
 const CLICK_METAL: u8 = 3;
+/// Thấu kính dùng frame sống của ScreenCaptureKit (video vẫn động trong kính)
+const CLICK_LIVE: u8 = 4;
 
 /// Các mục của popup "Click effects": (giá trị lưu, tên hiển thị).
 /// Giá trị giữ nguyên để không lệch với dữ liệu đã lưu (0 = fireworks, 2 = off,
 /// 3 = metal; 1 là "ripple" đã bỏ nên giờ rơi về fireworks).
-const CLICK_MENU: [(u8, &str); 3] = [
+const CLICK_MENU: [(u8, &str); 4] = [
     (CLICK_FIREWORKS, "Fireworks"),
     (CLICK_METAL, "Metal warp"),
+    (CLICK_LIVE, "Live warp (video)"),
     (CLICK_OFF, "Off"),
 ];
 static CLICK_EFFECT: AtomicU8 = AtomicU8::new(CLICK_FIREWORKS);
@@ -232,10 +235,36 @@ const MAX_MOUSE_SAMPLES: usize = 512;
 
 static SETTINGS_WINDOW: OnceLock<usize> = OnceLock::new();
 /// (window number, frame) của các cửa sổ overlay — dùng để chụp màn hình nằm dưới
-/// đúng cửa sổ overlay đang chứa điểm click.
-static OVERLAY_WINDOWS: OnceLock<Vec<(u32, CGRect)>> = OnceLock::new();
-pub(crate) fn overlay_windows() -> Option<&'static [(u32, CGRect)]> {
-    OVERLAY_WINDOWS.get().map(|v| v.as_slice())
+/// đúng cửa sổ overlay đang chứa điểm click. Dựng lại được khi màn hình thay đổi
+/// (sleep, logout/login, cắm/rút DP) nên không dùng `OnceLock`.
+static OVERLAY_WINDOWS: Mutex<Vec<(u32, CGRect)>> = Mutex::new(Vec::new());
+/// (view, offset_x, offset_y) của từng cửa sổ overlay đang sống.
+static VIEWS: Mutex<Vec<(usize, f64, f64)>> = Mutex::new(Vec::new());
+/// Chiều cao màn hình chính cho phép lật trục Y của CGEvent; đổi khi cách sắp xếp
+/// màn hình thay đổi nên lưu ở dạng cập nhật được thay vì biến capture.
+static SCREEN_HEIGHT: AtomicU64 = AtomicU64::new(0.0f64.to_bits());
+
+pub(crate) fn overlay_windows() -> Vec<(u32, CGRect)> {
+    match OVERLAY_WINDOWS.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+fn views() -> Vec<(usize, f64, f64)> {
+    match VIEWS.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Chiều cao màn hình chính (point, gốc trên-trái như CGEvent).
+fn screen_height() -> f64 {
+    let bits = SCREEN_HEIGHT.load(Ordering::Relaxed);
+    if bits != 0.0f64.to_bits() {
+        return f64::from_bits(bits);
+    }
+    unsafe { CGDisplayBounds(CGMainDisplayID()).size.height }
 }
 
 static STATUS_ITEM: OnceLock<usize> = OnceLock::new();
@@ -293,6 +322,7 @@ fn load_effect_preferences() {
             let effect = match value {
                 2 => CLICK_OFF,
                 3 => CLICK_METAL,
+                4 => CLICK_LIVE,
                 _ => CLICK_FIREWORKS,
             };
             CLICK_EFFECT.store(effect, Ordering::Relaxed);
@@ -2215,25 +2245,38 @@ fn register_view_class() -> *const Class {
     decl.register()
 }
 
-fn main() {
-    let trusted = accessibility_granted();
-
+/// Dựng lại toàn bộ cửa sổ overlay theo danh sách màn hình hiện tại.
+///
+/// Cửa sổ overlay không sống sót qua sleep/logout rồi login của WindowServer, nên
+/// nếu chỉ tạo một lần lúc mở app thì màn hình phụ sẽ mất hiệu ứng cho tới khi
+/// khởi động lại app.
+fn rebuild_overlays(view_class: *const Class) {
     unsafe {
-        let _pool = NSAutoreleasePool::new(nil);
-        let app = NSApp();
-        app.setActivationPolicy_(NSApplicationActivationPolicyAccessory);
+        SCREEN_HEIGHT.store(
+            CGDisplayBounds(CGMainDisplayID()).size.height.to_bits(),
+            Ordering::Relaxed,
+        );
 
-        // Không dùng [NSScreen mainScreen]: nó trả về màn hình đang có cửa sổ nhận
-        // phím (có thể là màn phụ), làm sai phép lật trục Y. CGEvent dùng toạ độ
-        // gốc ở góc trên-trái của màn hình chính, nên lấy đúng chiều cao của nó.
-        let main_display_bounds = CGDisplayBounds(CGMainDisplayID());
-        let screen_height = main_display_bounds.size.height;
+        // Đóng cửa sổ cũ trước khi dựng lại
+        for (view, _, _) in views() {
+            let view = view as id;
+            let window: id = msg_send![view, window];
+            if window != nil {
+                let _: () = msg_send![window, orderOut: nil];
+                let _: () = msg_send![window, setContentView: nil];
+                let _: () = msg_send![window, release];
+            }
+            let _: () = msg_send![view, release];
+        }
+        if let Ok(mut guard) = VIEWS.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = OVERLAY_WINDOWS.lock() {
+            guard.clear();
+        }
 
-        // Mỗi màn hình (MacBook, màn hình ngoài qua DP/HDMI...) một cửa sổ overlay riêng
-        let view_class = register_view_class();
-        // (view, offset_x, offset_y) của từng cửa sổ overlay
-        let mut views: Vec<(usize, f64, f64)> = Vec::new();
-        let mut overlay_windows: Vec<(u32, CGRect)> = Vec::new();
+        let mut new_views: Vec<(usize, f64, f64)> = Vec::new();
+        let mut new_windows: Vec<(u32, CGRect)> = Vec::new();
         let screens: id = msg_send![class!(NSScreen), screens];
         let screen_count: usize = msg_send![screens, count];
         for index in 0..screen_count {
@@ -2262,18 +2305,87 @@ fn main() {
             ];
             window.setContentView_(view);
             window.makeKeyAndOrderFront_(nil);
-            views.push((view as usize, frame.origin.x, frame.origin.y));
+            new_views.push((view as usize, frame.origin.x, frame.origin.y));
 
             let window_frame = CGRect::new(
                 &CGPoint::new(frame.origin.x, frame.origin.y),
                 &CGSize::new(frame.size.width, frame.size.height),
             );
             let number: i64 = msg_send![window, windowNumber];
-            overlay_windows.push((number as u32, window_frame));
+            new_windows.push((number as u32, window_frame));
         }
-        let _ = OVERLAY_WINDOWS.set(overlay_windows);
+        if let Ok(mut guard) = VIEWS.lock() {
+            *guard = new_views;
+        }
+        if let Ok(mut guard) = OVERLAY_WINDOWS.lock() {
+            *guard = new_windows;
+        }
+        // Dọn pixel còn lại trên overlay mới và bỏ frame sống của phiên trước
+        if let Ok(mut scene) = get_scene().lock() {
+            scene.full_refresh = true;
+        }
+        click::live::reset();
+    }
+}
 
-        eprintln!("Overlay đã tạo cho {} màn hình.", views.len());
+/// Nghe các sự kiện làm cửa sổ overlay mất hiệu lực: đổi cách sắp xếp/độ phân
+/// giải màn hình, máy thức dậy sau sleep, phiên đăng nhập được kích hoạt lại.
+fn watch_display_changes(view_class: *const Class) {
+    unsafe {
+        let handler = block::ConcreteBlock::new(move |_note: id| {
+            rebuild_overlays(view_class);
+        })
+        .copy();
+
+        let center: id = msg_send![class!(NSNotificationCenter), defaultCenter];
+        let name = nsstring("NSApplicationDidChangeScreenParametersNotification");
+        let _: id = msg_send![
+            center,
+            addObserverForName: name
+            object: nil
+            queue: nil
+            usingBlock: &*handler
+        ];
+
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let workspace_center: id = msg_send![workspace, notificationCenter];
+        for name in [
+            "NSWorkspaceDidWakeNotification",
+            "NSWorkspaceScreensDidWakeNotification",
+            "NSWorkspaceSessionDidBecomeActiveNotification",
+        ] {
+            let name = nsstring(name);
+            let _: id = msg_send![
+                workspace_center,
+                addObserverForName: name
+                object: nil
+                queue: nil
+                usingBlock: &*handler
+            ];
+        }
+    }
+}
+
+fn main() {
+    let trusted = accessibility_granted();
+
+    unsafe {
+        let _pool = NSAutoreleasePool::new(nil);
+        let app = NSApp();
+        app.setActivationPolicy_(NSApplicationActivationPolicyAccessory);
+
+        // Không dùng [NSScreen mainScreen]: nó trả về màn hình đang có cửa sổ nhận
+        // phím (có thể là màn phụ), làm sai phép lật trục Y. CGEvent dùng toạ độ
+        // gốc ở góc trên-trái của màn hình chính, nên lấy đúng chiều cao của nó.
+        let main_display_bounds = CGDisplayBounds(CGMainDisplayID());
+
+        // Mỗi màn hình (MacBook, màn hình ngoài qua DP/HDMI...) một cửa sổ overlay riêng
+        let view_class = register_view_class();
+        // Mỗi màn hình (MacBook, màn hình ngoài qua DP/HDMI...) một cửa sổ overlay
+        // riêng; dựng lại mỗi khi màn hình đổi hoặc máy vừa thức dậy.
+        rebuild_overlays(view_class);
+        watch_display_changes(view_class);
+        eprintln!("Overlay đã tạo cho {} màn hình.", views().len());
 
         // Tiếng click, hiệu ứng, panel settings và icon trên menu bar
         load_sound_preference();
@@ -2283,7 +2395,7 @@ fn main() {
         preload_sound_kind();
 
         // Sóng nước thật cần chụp màn hình để bẻ cong ảnh phía sau
-        if click_effect() == CLICK_METAL && !screen_capture_granted() {
+        if matches!(click_effect(), CLICK_METAL | CLICK_LIVE) && !screen_capture_granted() {
             request_screen_capture_access();
         }
 
@@ -2291,7 +2403,7 @@ fn main() {
         if click_effect() == CLICK_FIREWORKS {
             spawn_firework(
                 main_display_bounds.size.width / 2.0,
-                screen_height / 2.0,
+                screen_height() / 2.0,
             );
         }
         let controller: id = msg_send![register_controller_class(), new];
@@ -2317,7 +2429,7 @@ fn main() {
                                 let loc = event.location();
                                 push_mouse_sample(
                                     loc.x,
-                                    screen_height - loc.y,
+                                    screen_height() - loc.y,
                                     Instant::now(),
                                 );
                             }
@@ -2333,7 +2445,7 @@ fn main() {
                         }
                         _ => {
                             let loc = event.location();
-                            let cocoa_y = screen_height - loc.y;
+                            let cocoa_y = screen_height() - loc.y;
                             if let Ok(mut clicks) = PENDING_CLICKS.lock() {
                                 clicks.push((loc.x, cocoa_y));
                             }
@@ -2431,8 +2543,8 @@ fn main() {
             };
 
             if full_refresh {
-                for (view, _, _) in &views {
-                    let v = *view as id;
+                for (view, _, _) in views() {
+                    let v = view as id;
                     let _: () = msg_send![v, setNeedsDisplay: YES];
                 }
                 return;
@@ -2442,10 +2554,9 @@ fn main() {
             // đã gộp vùng của 45 frame gần nhất nên pixel cũ cũng được xoá theo.
             if let Some((x0, y0, x1, y1)) = dirty {
                 let size = NSSize::new((x1 - x0).max(1.0), (y1 - y0).max(1.0));
-                for (view, offset_x, offset_y) in &views {
-                    let v = *view as id;
-                    let rect =
-                        NSRect::new(NSPoint::new(x0 - *offset_x, y0 - *offset_y), size);
+                for (view, offset_x, offset_y) in views() {
+                    let v = view as id;
+                    let rect = NSRect::new(NSPoint::new(x0 - offset_x, y0 - offset_y), size);
                     let _: () = msg_send![v, setNeedsDisplayInRect: rect];
                 }
             }
