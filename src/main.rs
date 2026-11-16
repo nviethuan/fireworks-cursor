@@ -2380,17 +2380,38 @@ fn main() {
             }
             tick();
 
-            let (dirty, idle) = match get_scene().lock() {
-                Ok(scene) => (scene.dirty_bounds, scene.idle_secs > 0.12),
+            let (dirty, idle, warp_only) = match get_scene().lock() {
+                Ok(scene) => (
+                    scene.dirty_bounds,
+                    scene.idle_secs > 0.12,
+                    // Chỉ còn thấu kính warp đang động: không hạt, không dải neon
+                    scene.particles.is_empty()
+                        && scene.trail.is_empty()
+                        && click::metal::animating(),
+                ),
                 Err(poisoned) => {
                     let scene = poisoned.into_inner();
-                    (scene.dirty_bounds, scene.idle_secs > 0.12)
+                    (
+                        scene.dirty_bounds,
+                        scene.idle_secs > 0.12,
+                        scene.particles.is_empty()
+                            && scene.trail.is_empty()
+                            && click::metal::animating(),
+                    )
                 }
             };
 
+            // Chỉ có thấu kính warp: ảnh warp chỉ dựng lại 18 fps
+            // (`warp::RENDER_INTERVAL`) nên vẽ lại overlay ~20 fps là đủ liền mạch.
+            static WARP_PARITY: AtomicUsize = AtomicUsize::new(0);
             // Chuột đứng yên thì chỉ cần 30 fps cho các đốm lấp lánh -> nhẹ CPU
             static PARITY: AtomicUsize = AtomicUsize::new(0);
-            let skip_frame = idle && PARITY.fetch_add(1, Ordering::Relaxed) % 2 == 1;
+            let skip_frame = if warp_only {
+                // Timer chạy ~62,5 fps: vẽ 1 trong 3 frame -> ~20,8 fps
+                WARP_PARITY.fetch_add(1, Ordering::Relaxed) % 3 != 0
+            } else {
+                idle && PARITY.fetch_add(1, Ordering::Relaxed) % 2 == 1
+            };
             if skip_frame {
                 return;
             }

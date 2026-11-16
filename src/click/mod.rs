@@ -10,13 +10,13 @@ pub mod metal;
 pub mod warp;
 
 use cocoa::base::{id, nil};
-use cocoa::foundation::NSSize;
+
 use core_graphics::display::{CGDisplayBounds, CGMainDisplayID};
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use core_graphics::sys::CGImageRef;
 use core_graphics::window::{kCGWindowImageBestResolution, kCGWindowListOptionOnScreenBelowWindow};
 use objc::runtime::Class;
-use objc::{class, msg_send, sel, sel_impl};
+use objc::{msg_send, sel, sel_impl};
 use std::ffi::CString;
 use std::sync::OnceLock;
 
@@ -58,9 +58,7 @@ pub struct Frame {
 
 /// Ảnh chụp màn hình phía sau một điểm click.
 pub struct ScreenPatch {
-    /// `NSImage` đã retain (+1)
-    pub image: id,
-    /// `CIImage` cùng nội dung, đã retain (+1), dùng cho Core Image
+    /// `CIImage` của vùng đã chụp, đã retain (+1), gốc ảnh ở (0,0)
     pub ci: id,
     /// Kích thước ảnh trên màn hình, tính bằng point
     pub size: (f64, f64),
@@ -72,7 +70,6 @@ pub struct ScreenPatch {
 impl Drop for ScreenPatch {
     fn drop(&mut self) {
         unsafe {
-            let _: () = msg_send![self.image, release];
             let _: () = msg_send![self.ci, release];
         }
     }
@@ -85,8 +82,9 @@ unsafe impl Send for ScreenPatch {}
 /// Chụp vùng màn hình quanh điểm click (không gồm overlay của chính app).
 /// Trả về `None` nếu chưa được cấp quyền Screen Recording.
 pub fn capture_patch(cx: f64, cy: f64, half: f64) -> Option<ScreenPatch> {
+    let (window_number, frame) = overlay_window_at(cx, cy)?;
+    // WindowServer render lại đúng vùng cần chụp (~17-30 ms trên M1)
     unsafe {
-        let (window_number, frame) = overlay_window_at(cx, cy)?;
 
         let x0 = (cx - half).max(frame.origin.x);
         let y0 = (cy - half).max(frame.origin.y);
@@ -118,18 +116,12 @@ pub fn capture_patch(cx: f64, cy: f64, half: f64) -> Option<ScreenPatch> {
         // imageWithCGImage: trả object autorelease -> phải retain để giữ tới lúc Drop
         let ci: id = msg_send![ci_class, imageWithCGImage: raw];
         let ci: id = msg_send![ci, retain];
-        let image: id = msg_send![class!(NSImage), alloc];
-        let image: id = msg_send![image, initWithCGImage: raw size: NSSize::new(w, h)];
         CGImageRelease(raw);
-        if image == nil || ci == nil {
-            if image != nil {
-                let _: () = msg_send![image, release];
-            }
+        if ci == nil {
             return None;
         }
 
         Some(ScreenPatch {
-            image,
             ci,
             size: (w, h),
             x: x0,

@@ -16,8 +16,10 @@ use std::sync::Mutex;
 
 const LIFE: f64 = 1.2;
 /// Nửa cạnh vùng màn hình chụp quanh điểm click (point). Phải phủ hết bán kính
-/// clip của thấu kính: radius tối đa 114 * 1.08 ≈ 123 pt (xem `warp::WarpImage`).
-const PATCH_HALF: f64 = 126.0;
+/// clip của thấu kính: radius tối đa 72 * 1.08 ≈ 78 pt (xem `warp::WarpImage`).
+/// Chụp 2x nên vùng 160×160 pt đã là 320×320 px — nhỏ hơn nhiều so với 126 trước
+/// đây (504×504 px) mà thấu kính chỉ nhỏ đi ~37% đường kính.
+const PATCH_HALF: f64 = 80.0;
 const MAX_HITS: usize = 6;
 
 struct Hit {
@@ -68,10 +70,15 @@ pub fn clear() {
     hits().clear();
 }
 
+/// Có thấu kính nào đang động không (còn hiệu lực vẽ từng frame).
+pub fn animating() -> bool {
+    !hits().is_empty()
+}
+
 pub fn bounds() -> Option<Bounds> {
     let mut union: Option<Bounds> = None;
     for hit in hits().iter() {
-        let b = crate::click::square_around(hit.x, hit.y, 118.0);
+        let b = crate::click::square_around(hit.x, hit.y, 80.0);
         union = Some(match union {
             Some(u) => (u.0.min(b.0), u.1.min(b.1), u.2.max(b.2), u.3.max(b.3)),
             None => b,
@@ -83,7 +90,7 @@ pub fn bounds() -> Option<Bounds> {
 /// Bán kính thấu kính và độ phồng hiện tại theo tuổi của cú click.
 fn lens(age: f64) -> (f64, f64) {
     let t = (age / LIFE).clamp(0.0, 1.0);
-    let radius = 26.0 + 88.0 * (1.0 - (1.0 - t).powi(2));
+    let radius = 20.0 + 52.0 * (1.0 - (1.0 - t).powi(2));
     // Phồng -> lõm -> phồng nhẹ rồi tắt, giống mặt nước bị ấn
     let wave = (t * TAU * 1.3).sin();
     let scale = 0.55 * wave * (1.0 - t).powf(1.1);

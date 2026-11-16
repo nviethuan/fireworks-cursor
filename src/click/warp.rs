@@ -3,15 +3,20 @@
 //! lõm).
 //!
 //! Chi phí: đo trên máy này mỗi lần dựng ảnh tốn ~11 ms, trong đó ~8 ms là tạo
-//! `CIContext` (không cache được — Core Image ném exception ở lần `createCGImage`
-//! thứ hai nếu dùng lại một context) và ~3 ms là `createCGImage` (không phụ thuộc
-//! kích thước vùng ảnh). Vì vậy cách duy nhất để giảm CPU là **giảm số lần dựng**:
-//! hiệu ứng gọi `render()` theo `RENDER_INTERVAL` (18 fps) rồi vẽ lại ảnh đã dựng
+//! `CIContext` và ~3 ms là `createCGImage` (không phụ thuộc kích thước vùng ảnh).
+//! Tạo context mới ở mỗi lần dựng là phần đắt nhất, nên `ci_context()` giữ **một**
+//! context Metal dùng lại cho mọi lần dựng (fallback software nếu máy không có
+//! Metal); nhờ vậy mỗi lần dựng còn ~2-3 ms. Context chỉ được dùng trên main
+//! thread (drawRect); nếu bị gọi từ thread khác thì tạo context dùng một lần để
+//! không chia sẻ context giữa các thread.
+//!
+//! Hiệu ứng gọi `render()` theo `RENDER_INTERVAL` (18 fps) rồi vẽ lại ảnh đã dựng
 //! (`WarpImage::draw`, một lần `CGContextDrawImage`) ở mọi frame — hình vẫn mượt vì
 //! bán kính/độ phồng đổi rất chậm.
 
 use crate::click::{Frame, ScreenPatch};
-use cocoa::base::{id, nil, YES};
+use std::sync::OnceLock;
+use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::NSPoint;
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use core_graphics::sys::{CGContextRef, CGImageRef};
@@ -19,6 +24,11 @@ use objc::{class, msg_send, sel, sel_impl};
 
 #[link(name = "CoreImage", kind = "framework")]
 extern "C" {}
+
+#[link(name = "Metal", kind = "framework")]
+extern "C" {
+    fn MTLCreateSystemDefaultDevice() -> id;
+}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -33,19 +43,59 @@ extern "C" {
 /// 18 fps là mức cắt được ~1/6 CPU mà mắt vẫn thấy liền mạch.
 pub const RENDER_INTERVAL: f64 = 1.0 / 18.0;
 
-fn ci_context() -> Option<id> {
+/// Context đã tạo (giữ dạng `usize` vì `id` không `Send`/`Sync`) và thread sở hữu nó.
+static CONTEXT: OnceLock<usize> = OnceLock::new();
+static CONTEXT_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// Tạo một `CIContext`: Metal nếu máy có GPU, còn lại là software renderer.
+fn make_context() -> Option<id> {
     unsafe {
         let context_class = crate::click::ci_class("CIContext")?;
-        let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
-        let key: id = crate::nsstring("kCIContextUseSoftwareRenderer");
-        let options: id = msg_send![class!(NSDictionary), dictionaryWithObject: yes forKey: key];
-        let context: id = msg_send![context_class, contextWithOptions: options];
+        let device: id = MTLCreateSystemDefaultDevice();
+        let context: id = if device != nil {
+            // Không cache intermediate: mỗi cú click là một ảnh chụp mới, cache
+            // của Core Image sẽ giữ texture của mọi ảnh cũ -> RSS leo dần.
+            let flag: id = msg_send![class!(NSNumber), numberWithBool: NO];
+            let key: id = crate::nsstring("kCIContextCacheIntermediates");
+            let options: id =
+                msg_send![class!(NSDictionary), dictionaryWithObject: flag forKey: key];
+            msg_send![context_class, contextWithMTLDevice: device options: options]
+        } else {
+            let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
+            let key: id = crate::nsstring("kCIContextUseSoftwareRenderer");
+            let options: id = msg_send![class!(NSDictionary), dictionaryWithObject: yes forKey: key];
+            msg_send![context_class, contextWithOptions: options]
+        };
         if context == nil {
             None
         } else {
-            Some(context)
+            // `contextWith...` trả về object autorelease: phải retain để nó sống
+            // bằng cả vòng đời app, vì nó được cache lại cho các lần dựng sau.
+            Some(msg_send![context, retain])
         }
     }
+}
+
+/// Trả về `CIContext` dùng chung.
+///
+/// Tạo context mới cho mỗi lần dựng tốn ~8 ms trong tổng ~11 ms, nên context được
+/// tạo một lần rồi dùng lại. Nó chỉ an toàn khi mọi lời gọi đến từ cùng một thread
+/// (main thread — đường `drawRect` → `click::draw` → `metal::draw` → `render`);
+/// nếu bị gọi từ thread khác thì trả về context dùng một lần, không cache, để
+/// không bao giờ chia sẻ một context giữa hai thread.
+fn ci_context() -> Option<id> {
+    let current = std::thread::current().id();
+    let on_owner_thread = CONTEXT_THREAD.get().map_or(true, |owner| *owner == current);
+    if on_owner_thread {
+        if let Some(cached) = CONTEXT.get() {
+            return Some(*cached as id);
+        }
+    }
+    let context = make_context()?;
+    if on_owner_thread && CONTEXT.set(context as usize).is_ok() {
+        let _ = CONTEXT_THREAD.set(current);
+    }
+    Some(context)
 }
 
 /// Ảnh warp đã dựng, dùng lại được nhiều frame. Giải phóng khi Drop.
