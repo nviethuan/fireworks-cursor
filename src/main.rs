@@ -198,7 +198,7 @@ const CLICK_LIVE: u8 = 4;
 const CLICK_MENU: [(u8, &str); 4] = [
     (CLICK_FIREWORKS, "Fireworks"),
     (CLICK_METAL, "Metal warp"),
-    (CLICK_LIVE, "Live warp (video)"),
+    (CLICK_LIVE, "Live warp (snapshot)"),
     (CLICK_OFF, "Off"),
 ];
 static CLICK_EFFECT: AtomicU8 = AtomicU8::new(CLICK_FIREWORKS);

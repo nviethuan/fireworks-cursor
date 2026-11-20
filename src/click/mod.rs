@@ -1,12 +1,16 @@
 //! Hiệu ứng khi click. Mỗi hiệu ứng nằm trong một file riêng để dễ thêm/bỏ:
 //!
 //! * `metal.rs`  — warp ảnh chụp màn hình thành "thấu kính nước" (Core Image)
-//! * `live.rs`   — cùng kiểu thấu kính nhưng lấy frame sống (ScreenCaptureKit)
+//! * `live.rs`   — cùng kiểu thấu kính nhưng chụp lại vùng màn hình ~12 hình/giây
+//!   trong lúc thấu kính sống (không dùng luồng video ScreenCaptureKit)
+//! * `lens.rs`   — phần dùng chung của `metal.rs` và `live.rs` (tuổi thấu kính,
+//!   warp, vẽ, vùng cần vẽ lại); hai file kia chỉ khác chính sách chụp ảnh
 //! * `warp.rs`   — phần warp ảnh dùng chung (dựng ảnh + cache)
 //!
 //! Muốn bỏ một hiệu ứng: xoá file tương ứng, xoá `pub mod` ở đây, xoá nhánh
 //! trong `spawn()` và mục trong `CLICK_MENU` ở `main.rs`.
 
+pub mod lens;
 pub mod live;
 pub mod metal;
 pub mod warp;
