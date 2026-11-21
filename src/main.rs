@@ -6,14 +6,19 @@ use cocoa::appkit::{
 };
 use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
-use core_foundation::base::TCFType;
+use core_foundation::base::{CFType, TCFType};
+use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
+use core_foundation::number::CFNumber;
+use core_foundation::string::CFString;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun};
 use core_graphics::context::CGContext;
 use core_graphics::display::{CGDisplayBounds, CGMainDisplayID};
 use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+use core_graphics::window::{copy_window_info, kCGNullWindowID, kCGWindowListOptionOnScreenOnly};
 use core_graphics::sys::CGContextRef;
 use core_graphics::event::{
-    CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+    CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, EventField,
 };
 use objc::declare::ClassDecl;
 use objc::runtime::{Class, Object, Sel};
@@ -21,7 +26,7 @@ use objc::{class, msg_send, sel, sel_impl};
 use rand::Rng;
 use std::collections::HashSet;
 use std::f64::consts::TAU;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
@@ -228,6 +233,7 @@ const IDLE_HIDE_SECS: f64 = 5.0;
 static MOUSE_SAMPLES: Mutex<Vec<MouseSample>> = Mutex::new(Vec::new());
 /// Mach port của event tap, để bật lại khi macOS tự ngắt (0 = chưa có)
 static EVENT_TAP_PORT: AtomicUsize = AtomicUsize::new(0);
+static KEY_TAP_PORT: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_MOUSE_SAMPLES: usize = 512;
 
@@ -255,6 +261,58 @@ fn views() -> Vec<(usize, f64, f64)> {
     match VIEWS.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// macOS đang mở UI chụp màn hình (⌘⇧5 hoặc ⌘⇧4 rồi Space) nên overlay phải ẩn.
+static UI_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// Đã thấy cửa sổ của UI chụp màn hình trong phiên này chưa — để phân biệt "UI vừa
+/// mở, chưa dựng xong cửa sổ" với "UI vừa đóng, process còn sống thêm vài giây".
+static UI_SAW_WINDOWS: AtomicBool = AtomicBool::new(false);
+/// Mốc (ms) overlay được yêu cầu ẩn ngay khi bấm ⌘⇧4/⌘⇧5, trước cả khi process UI
+/// xuất hiện; timer không được hiện lại trước mốc này.
+static UI_FORCED_HIDE_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// Mốc (ms) process UI đang chạy mà không có cửa sổ nào; 0 = có cửa sổ hoặc không
+/// chạy. Dùng để thoát khỏi trạng thái ẩn khi bỏ lỡ cửa sổ của UI lúc nó mở/đóng.
+static UI_WINDOWLESS_SINCE: AtomicU64 = AtomicU64::new(0);
+/// Tổ hợp phím chụp màn hình vừa bấm (20 = ⌘⇧3, 21 = ⌘⇧4, 23 = ⌘⇧5), 0 = chưa bấm.
+static UI_HOTKEY: AtomicU64 = AtomicU64::new(0);
+/// Mốc (ms) được phép hiện overlay trở lại dù cửa sổ UI còn sót lại trên màn hình.
+static UI_RELEASE_AT: AtomicU64 = AtomicU64::new(0);
+/// PID của UI đã chụp xong: cửa sổ còn sót của nó không giữ overlay ẩn nữa.
+static UI_IGNORE_PID: AtomicI32 = AtomicI32::new(0);
+static UI_CURRENT_PID: AtomicI32 = AtomicI32::new(0);
+static UI_CLOCK: OnceLock<Instant> = OnceLock::new();
+
+fn ui_now_ms() -> u64 {
+    UI_CLOCK.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Ẩn/hiện lại các cửa sổ overlay. Hiệu ứng đang chạy vẫn tiếp tục trong bộ nhớ,
+/// chỉ là cửa sổ tạm không được đưa lên màn hình.
+fn set_overlays_visible(visible: bool) {
+    UI_HIDDEN.store(!visible, Ordering::Relaxed);
+    if visible {
+        // Cửa sổ vừa được đưa lại lên màn hình sau khi ẩn: nội dung cũ có thể đã bị
+        // bỏ, nên vẽ lại toàn bộ một lần thay vì chờ vùng dirty đầu tiên.
+        match get_scene().lock() {
+            Ok(mut scene) => scene.full_refresh = true,
+            Err(poisoned) => poisoned.into_inner().full_refresh = true,
+        }
+    }
+    unsafe {
+        for (view, _, _) in views() {
+            let window: id = msg_send![view as id, window];
+            if window == nil {
+                continue;
+            }
+            if visible {
+                // `orderFrontRegardless` để không cướp key window của app khác
+                let _: () = msg_send![window, orderFrontRegardless];
+            } else {
+                let _: () = msg_send![window, orderOut: nil];
+            }
+        }
     }
 }
 
@@ -2291,12 +2349,28 @@ fn rebuild_overlays(view_class: *const Class) {
             );
             window.setBackgroundColor_(NSColor::clearColor(nil));
             window.setOpaque_(NO);
+            window.setHasShadow_(NO);
+            // Nổi trên mọi cửa sổ (kể cả app full-screen) nhưng không nhận chuột:
+            // click vẫn đi xuống app bên dưới.
             window.setIgnoresMouseEvents_(YES);
             window.setLevel_(1000);
             window.setCollectionBehavior_(
                 NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
-                    | NSWindowCollectionBehavior::NSWindowCollectionBehaviorStationary,
+                    | NSWindowCollectionBehavior::NSWindowCollectionBehaviorStationary
+                    | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
+                    | NSWindowCollectionBehavior::NSWindowCollectionBehaviorIgnoresCycle,
             );
+            // `NSWindowSharingNone`: loại cửa sổ overlay khỏi ảnh chụp/quay màn hình.
+            // Đây là cửa sổ phủ kín màn hình nằm trên cùng, nên nếu để mặc định
+            // (`NSWindowSharingReadOnly`) thì chế độ "chụp cửa sổ" (⌘⇧4 rồi Space)
+            // sẽ chọn đúng overlay trong suốt này thay cho cửa sổ bên dưới và ảnh
+            // nhận được chỉ có phần thấu kính. Ẩn khỏi capture thì WindowServer
+            // bỏ qua nó và chụp đúng cửa sổ mà người dùng chỉ vào.
+            let _: () = msg_send![window, setSharingType: 0usize];
+            // Không để AppKit làm hiệu ứng mờ dần khi ẩn/hiện: cửa sổ sẽ còn nằm
+            // trên màn hình ~0,3 s sau `orderOut:` — đúng lúc UI chụp màn hình đang
+            // liệt kê cửa sổ. `NSWindowAnimationBehaviorNone` = 2.
+            let _: () = msg_send![window, setAnimationBehavior: 2isize];
 
             let view: id = msg_send![view_class, alloc];
             let view: id = msg_send![
@@ -2305,6 +2379,10 @@ fn rebuild_overlays(view_class: *const Class) {
             ];
             window.setContentView_(view);
             window.makeKeyAndOrderFront_(nil);
+            // UI chụp màn hình đang mở thì cửa sổ mới cũng phải ẩn theo
+            if UI_HIDDEN.load(Ordering::Relaxed) {
+                let _: () = msg_send![window, orderOut: nil];
+            }
             new_views.push((view as usize, frame.origin.x, frame.origin.y));
 
             let window_frame = CGRect::new(
@@ -2366,6 +2444,224 @@ fn watch_display_changes(view_class: *const Class) {
     }
 }
 
+/// Trạng thái UI chụp/quay màn hình của macOS: (đang chạy, có cửa sổ trên màn hình).
+///
+/// UI đó là app `Screenshot` (`com.apple.screencaptureui`), mở bằng ⌘⇧5 hoặc ⌘⇧4
+/// rồi Space. Nó chọn cửa sổ nằm trên cùng dưới con trỏ, mà overlay của app là cửa
+/// sổ phủ kín màn hình ở layer 1000 và đã bị loại khỏi capture
+/// (`NSWindowSharingNone`, xem `rebuild_overlays`) — nên chế độ chụp/quay theo cửa
+/// sổ không có gì để chụp và không tạo ra ảnh. Ẩn overlay trong lúc UI hiện thì
+/// picker thấy đúng cửa sổ thật bên dưới.
+///
+/// UI này là app nền: `NSWorkspace` không phát launch/terminate notification, và
+/// process còn sống thêm vài giây sau khi UI đóng — nên phải hỏi định kỳ xem nó có
+/// cửa sổ nào đang hiện. Danh sách cửa sổ chỉ được tra khi app đó đang chạy.
+fn screenshot_ui_state() -> (bool, bool) {
+    let pid: i32 = unsafe {
+        let apps: id = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationsWithBundleIdentifier: nsstring("com.apple.screencaptureui")
+        ];
+        if apps == nil {
+            return (false, false);
+        }
+        let count: usize = msg_send![apps, count];
+        if count == 0 {
+            return (false, false);
+        }
+        let app: id = msg_send![apps, objectAtIndex: 0usize];
+        msg_send![app, processIdentifier]
+    };
+
+    UI_CURRENT_PID.store(pid, Ordering::Relaxed);
+    let pid_key = CFString::new("kCGWindowOwnerPID").into_CFType();
+    let bounds_key = CFString::new("kCGWindowBounds").into_CFType();
+    let width_key = CFString::new("Width").into_CFType();
+    let height_key = CFString::new("Height").into_CFType();
+    let Some(list) = copy_window_info(kCGWindowListOptionOnScreenOnly, kCGNullWindowID) else {
+        return (true, false);
+    };
+    // Chỉ cửa sổ lớn (vùng chọn phủ màn hình, toolbar ⌘⇧5) mới là "UI đang mở". Cửa
+    // sổ thumbnail sau khi chụp xong vẫn nằm đó vài giây, coi nó là UI mở thì overlay
+    // bị ẩn suốt thời gian thumbnail hiện.
+    let mut has_big_window = false;
+    for dict in list.get_all_values() {
+        if has_big_window {
+            break;
+        }
+        unsafe {
+            let dict = CFDictionary::<CFType, CFType>::wrap_under_get_rule(dict as CFDictionaryRef);
+            if dict
+                .find(&pid_key)
+                .and_then(|value| value.downcast::<CFNumber>())
+                .and_then(|number| number.to_i32())
+                != Some(pid)
+            {
+                continue;
+            }
+            let Some(bounds) = dict.find(&bounds_key) else {
+                continue;
+            };
+            if !bounds.instance_of::<CFDictionary<*const std::ffi::c_void, *const std::ffi::c_void>>()
+            {
+                continue;
+            }
+            let bounds = CFDictionary::<CFType, CFType>::wrap_under_get_rule(
+                bounds.as_concrete_TypeRef() as CFDictionaryRef,
+            );
+            let size = |key: &CFType| -> f64 {
+                bounds
+                    .find(key)
+                    .and_then(|value| value.downcast::<CFNumber>())
+                    .and_then(|number| number.to_f64())
+                    .unwrap_or(0.0)
+            };
+            has_big_window = size(&width_key).max(size(&height_key)) >= 600.0;
+        }
+    }
+    (true, has_big_window)
+}
+
+/// Tap riêng cho bàn phím, tách khỏi tap chuột: khi UI chụp màn hình mở, macOS bật
+/// Secure Input và tắt mọi tap có nghe bàn phím — nếu dùng chung tap thì hiệu ứng
+/// click (nguồn chuột của tap đó) chết theo. Mất tap này chỉ khiến việc ẩn overlay
+/// chậm lại bằng nhịp dò 100 ms, không ảnh hưởng hiệu ứng.
+fn spawn_key_tap() {
+    thread::spawn(move || {
+        let tap = CGEventTap::new(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::ListenOnly,
+            vec![CGEventType::KeyDown],
+            move |_proxy, etype, event| {
+                match etype {
+                    CGEventType::KeyDown => {
+                        // ⌘⇧4 / ⌘⇧5 sắp mở UI chụp màn hình: ẩn overlay ngay,
+                        // không chờ tới lúc UI dựng xong cửa sổ (~0,5 s).
+                        let key =
+                            event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                        let flags = event.get_flags();
+                        let shortcut = flags.contains(CGEventFlags::CGEventFlagCommand)
+                            && flags.contains(CGEventFlags::CGEventFlagShift);
+                        if shortcut && matches!(key, 20 | 21 | 23) {
+                            UI_HOTKEY.store(key as u64, Ordering::Relaxed);
+                            UI_IGNORE_PID.store(0, Ordering::Relaxed);
+                            // ⌘⇧3 chụp ngay, không có bước chọn -> chỉ cần ẩn một nhịp
+                            let release = if key == 20 { ui_now_ms() + 350 } else { 0 };
+                            UI_RELEASE_AT.store(release, Ordering::Relaxed);
+                            hide_overlays_now();
+                        } else if key == 53 && UI_HOTKEY.load(Ordering::Relaxed) != 0 {
+                            // Esc huỷ UI: cho overlay trở lại sau một nhịp
+                            UI_RELEASE_AT.store(ui_now_ms() + 300, Ordering::Relaxed);
+                        }
+                    }
+                    CGEventType::TapDisabledByTimeout
+                    | CGEventType::TapDisabledByUserInput => {
+                        let port = KEY_TAP_PORT.load(Ordering::Relaxed);
+                        if port != 0 {
+                            unsafe { CGEventTapEnable(port as *mut std::ffi::c_void, true) };
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            },
+        );
+
+        if let Ok(tap) = tap {
+            unsafe {
+                let loop_source = tap
+                    .mach_port
+                    .create_runloop_source(0)
+                    .expect("Không tạo được RunLoop source");
+                let run_loop = CFRunLoopGetCurrent();
+                CFRunLoopAddSource(
+                    run_loop,
+                    loop_source.as_concrete_TypeRef(),
+                    kCFRunLoopCommonModes,
+                );
+                KEY_TAP_PORT.store(
+                    tap.mach_port.as_concrete_TypeRef() as usize,
+                    Ordering::Relaxed,
+                );
+                tap.enable();
+                CFRunLoopRun();
+            }
+        }
+    });
+}
+
+/// Ẩn overlay ngay khi vừa bấm ⌘⇧4/⌘⇧5 (gọi từ event tap). AppKit chỉ được đụng
+/// tới cửa sổ trên main thread nên phần thật sự ẩn được đẩy sang main queue.
+fn hide_overlays_now() {
+    UI_FORCED_HIDE_UNTIL.store(ui_now_ms() + 1200, Ordering::Relaxed);
+    unsafe {
+        let handler = block::ConcreteBlock::new(|| set_overlays_visible(false)).copy();
+        let queue: id = msg_send![class!(NSOperationQueue), mainQueue];
+        let _: () = msg_send![queue, addOperationWithBlock: &*handler];
+    }
+}
+
+/// Ẩn overlay khi UI chụp màn hình mở, hiện lại khi UI đóng (kiểm tra 10 lần/giây).
+fn watch_screenshot_ui() {
+    unsafe {
+        let handler = block::ConcreteBlock::new(|_timer: id| {
+            let (running, windows) = screenshot_ui_state();
+            let now = ui_now_ms();
+            if running {
+                // Process đã xuất hiện thì không cần giữ ẩn "ép" nữa
+                UI_FORCED_HIDE_UNTIL.store(0, Ordering::Relaxed);
+                if windows {
+                    UI_SAW_WINDOWS.store(true, Ordering::Relaxed);
+                    UI_WINDOWLESS_SINCE.store(0, Ordering::Relaxed);
+                } else if UI_WINDOWLESS_SINCE.load(Ordering::Relaxed) == 0 {
+                    UI_WINDOWLESS_SINCE.store(now.max(1), Ordering::Relaxed);
+                }
+            } else {
+                UI_SAW_WINDOWS.store(false, Ordering::Relaxed);
+                UI_WINDOWLESS_SINCE.store(0, Ordering::Relaxed);
+                UI_IGNORE_PID.store(0, Ordering::Relaxed);
+            }
+            let saw = UI_SAW_WINDOWS.load(Ordering::Relaxed);
+            let windowless = UI_WINDOWLESS_SINCE.load(Ordering::Relaxed);
+            // UI vừa đóng: process còn sống thêm vài giây nhưng cửa sổ đã biến mất
+            let closing = saw && !windows;
+            // Bỏ lỡ cửa sổ lúc UI mở/đóng: không thấy cửa sổ nào quá lâu thì coi như
+            // đã đóng, tránh bị ẩn tới khi process kia chết.
+            let stale = windowless != 0 && now.saturating_sub(windowless) > 800;
+            let forced = now < UI_FORCED_HIDE_UNTIL.load(Ordering::Relaxed);
+            // Đã chụp xong (⌘⇧3, nhả chuột ở ⌘⇧4, Esc): cửa sổ thumbnail/host còn sót
+            // của UI không được giữ overlay ẩn nữa
+            let release_at = UI_RELEASE_AT.load(Ordering::Relaxed);
+            if release_at != 0 && now >= release_at {
+                UI_RELEASE_AT.store(0, Ordering::Relaxed);
+                UI_IGNORE_PID.store(UI_CURRENT_PID.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            let finished = UI_CURRENT_PID.load(Ordering::Relaxed) != 0
+                && UI_IGNORE_PID.load(Ordering::Relaxed) == UI_CURRENT_PID.load(Ordering::Relaxed);
+            // Ẩn ngay từ lúc process xuất hiện (chưa cần cửa sổ), và ẩn ngay khi vừa
+            // bấm phím tắt (lúc đó process UI còn chưa kịp khởi động)
+            let hide = (forced || (running && !closing && !stale)) && !finished;
+            if hide != UI_HIDDEN.load(Ordering::Relaxed) {
+                set_overlays_visible(!hide);
+            }
+        })
+        .copy();
+        let timer: id = msg_send![
+            class!(NSTimer),
+            timerWithTimeInterval: 0.1f64
+            repeats: YES
+            block: &*handler
+        ];
+        let run_loop: id = msg_send![class!(NSRunLoop), mainRunLoop];
+        let _: () = msg_send![
+            run_loop,
+            addTimer: timer
+            forMode: nsstring("kCFRunLoopCommonModes")
+        ];
+    }
+}
+
 fn main() {
     let trusted = accessibility_granted();
 
@@ -2385,6 +2681,7 @@ fn main() {
         // riêng; dựng lại mỗi khi màn hình đổi hoặc máy vừa thức dậy.
         rebuild_overlays(view_class);
         watch_display_changes(view_class);
+        watch_screenshot_ui();
         eprintln!("Overlay đã tạo cho {} màn hình.", views().len());
 
         // Tiếng click, hiệu ứng, panel settings và icon trên menu bar
@@ -2418,6 +2715,7 @@ fn main() {
                 CGEventTapOptions::ListenOnly,
                 vec![
                     CGEventType::LeftMouseDown,
+                    CGEventType::LeftMouseUp,
                     CGEventType::MouseMoved,
                     CGEventType::LeftMouseDragged,
                 ],
@@ -2441,6 +2739,16 @@ fn main() {
                             let port = EVENT_TAP_PORT.load(Ordering::Relaxed);
                             if port != 0 {
                                 CGEventTapEnable(port as *mut std::ffi::c_void, true);
+                            }
+                        }
+                        CGEventType::LeftMouseUp => {
+                            // Chọn vùng xong ở ⌘⇧4: ảnh đã chụp, cho overlay trở lại
+                            // sau ~300 ms thay vì đợi cửa sổ UI còn sót biến mất.
+                            if UI_HOTKEY.load(Ordering::Relaxed) == 21
+                                && UI_HIDDEN.load(Ordering::Relaxed)
+                                && UI_RELEASE_AT.load(Ordering::Relaxed) == 0
+                            {
+                                UI_RELEASE_AT.store(ui_now_ms() + 300, Ordering::Relaxed);
                             }
                         }
                         _ => {
@@ -2482,11 +2790,26 @@ fn main() {
                 }
             }
         });
+        spawn_key_tap();
         } else {
             eprintln!("Đang chạy chế độ chỉ hiển thị pháo hoa, click chưa được theo dõi.");
         }
 
         let timer_block = block::ConcreteBlock::new(move |_timer: id| {
+            // Secure Input (bật khi UI chụp màn hình chạy hoặc khi gõ mật khẩu) có
+            // thể tắt event tap mà không báo; bật lại định kỳ để hiệu ứng click
+            // không chết hẳn cho tới lần khởi động sau.
+            static TAP_WATCH: AtomicUsize = AtomicUsize::new(0);
+            if TAP_WATCH.fetch_add(1, Ordering::Relaxed) % 60 == 0 {
+                for port in [
+                    EVENT_TAP_PORT.load(Ordering::Relaxed),
+                    KEY_TAP_PORT.load(Ordering::Relaxed),
+                ] {
+                    if port != 0 {
+                        CGEventTapEnable(port as *mut std::ffi::c_void, true);
+                    }
+                }
+            }
             if SOUND_PENDING.swap(false, Ordering::Relaxed) {
                 play_click_sound();
             }
